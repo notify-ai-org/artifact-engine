@@ -1,0 +1,108 @@
+
+Build a library that exposes APIs accepts files and images, 
+stores their original artifacts durably, extracts searchable content, 
+generates RAG embeddings, and exposes authorized retrieval directly or through Model Context Protocol (MCP).
+
+It can:
+
+1. Accept artifacts without exhausting application memory.
+2. Survive object-storage outages and application restarts.
+3. Prevent duplicate ingestion and duplicate vector records.
+4. Isolate tenant data throughout storage and retrieval.
+5. Retrieve original artifacts, metadata, extracted text, and relevant chunks.
+6. Make the same retrieval capabilities available to MCP clients.
+
+## Structure 
+
+Retry - Design similar to retry4j
+Workers
+- Worker Manager.java - 
+    Initializes and restores worker states and stae machines, 
+    Adds workers on request, 
+    deletes workers on idle/request
+    Flushes worker snapshots 
+    returns worker states
+- Worker State Machines (StateMachine.java) - one for every job type
+    Each class stores the current state, previous states, list of valid transtions, state/transition callbacks
+    - Retrieval Job SM .java
+    - Ingest Job SM .java
+    - Fetch Job SM .java
+    - Index Job SM .java
+- Worker.java - one for every job type
+    Each worker is a thread that accepts incoming jobs and puts them in a local queue
+    Runs validation and sanitization filter chain
+    flushes job to buffer
+    collects batch buffer jobs
+    executes the job
+
+- Audit Logger.java - stores each job, its status, etc (upto you to think of this)
+
+Connectors (Connector.java interface)
+    Each has id,status,use count,etc(upto you to think of this)
+    Has methods init,bind,process,close
+  - File - Inbound (FileConnector.java)
+  - DB - Inbound (DBConnector.java)
+  - Custom - Inbound/Outbound (Will extend connector.java)
+  - S3 - Outbound (S3.java)
+  - etc
+  
+Connector Pool.java -> allocates connector instances on requests, restores them once used
+Job - each job has an execute method
+	- Retrieval Job.java
+    - Ingest Job.java
+    - Fetch Job.java
+    - Index Job.java
+
+Queue
+	- Queue Manager.java
+    - JobQueue.java
+    Use redis store
+
+Auth
+	- Data Verification thorough MIME type verfification,checksums, idempotency,duplicacy,
+    - OAuth Resource Server Plugin
+Embedder
+	- Embedding service.java
+       - Embedding cache.java
+       - Embedding provider.java
+Ingest Filter Chain.java
+retrieval Filter chain.java
+DurableSpool.java - local file system connector which keeps a copy of the file until flushed
+Buffer.java - Memory limit, time configurable buffers used by queue and workers
+Store 
+	- MetaDataStore - metadata crud
+	- VectorStore - vector crud
+    - ObjectStore
+    - LogStore
+Util
+	- Chunker.java
+	- OCR.java
+	- AcknowledgeHandler.java 
+    - VectorUtils.java
+    - Checksum.java
+	- LeaseManager.java
+    - Idempotency.java
+Models
+Metrics
+Facade Interface exposing relevant apis for ingestion and retrieval
+Spring
+	- Bean Configuration exposing the facade as spring bean or service
+    - defines stores for each metadata which uses JPA repositories
+
+Create a project structure similar to above
+Follow guidelines given in ARTIFACT_INTAKE_RAG_MCP_POC.md
+Write neat well documented and intented code
+
+
+
+
+
+
+
+
+
+
+
+
+
+
