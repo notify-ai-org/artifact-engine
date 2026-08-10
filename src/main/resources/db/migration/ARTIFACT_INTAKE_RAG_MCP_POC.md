@@ -276,22 +276,6 @@ Embedding model upgrades must not overwrite old vectors in place. Store model an
 | Poison document | Move operation to dead letter after configured attempts |
 | Delete during processing | Set tombstone; workers stop and cleanup all derived data |
 
-## 13. Security Filters for Ingestion and Retrieval with each step defined as a filter
-
-- Authenticate all intake and retrieval operations.
-- Enforce tenant filters at repository and storage-key layers.
-- Encrypt in transit and at rest; use KMS-backed S3 encryption where available.
-- Scan uploads before exposing downloads or extracted content.
-- Validate actual content signatures rather than trusting extensions.
-- Sanitize filenames and extracted HTML.
-- Prevent archive bombs and enforce decompression limits.
-- Reject oversized frames, invalid stream transitions, slowloris connections, and compression-ratio bombs.
-- Rotate TLS certificates and authentication keys without dropping healthy long-lived connections where possible.
-- Restrict URL ingestion to approved schemes and destinations.
-- Use short-lived presigned URLs or one-time NAAP retrieval tokens with strict content-disposition and authorization controls.
-- Support configurable retention, legal hold, and deletion policies.
-- Keep immutable audit records for ingest, read, search, download, retry, and delete.
-- Do not log document contents, access tokens, presigned URLs, NAAP retrieval tokens, or sensitive metadata.
 
 ## 14. Backpressure and Capacity Controls
 

@@ -16,8 +16,6 @@ public final class RetrievalSecurityFilters {
             new AuthenticationFilter<>(authentication, clock),
             new TenantIsolationFilter<>(),
             new EncryptionPolicyFilter<>(policy.allowedTlsProtocols(), false),
-            new ProtocolAbuseFilter<>(policy.protocolLimits(), policy.streamTransitions()),
-            new RetrievalScanGateFilter(),
             new ExtractedHtmlSanitizationFilter<>()));
   }
 

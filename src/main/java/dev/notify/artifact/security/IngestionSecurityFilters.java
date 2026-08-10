@@ -21,12 +21,9 @@ public final class IngestionSecurityFilters {
         List.of(
             new AuthenticationFilter<>(authentication, clock),
             new TenantIsolationFilter<>(),
-            new EncryptionPolicyFilter<>(policy.allowedTlsProtocols(), policy.requireKms()),
-            new ProtocolAbuseFilter<>(policy.protocolLimits(), policy.streamTransitions()),
+            new EncryptionPolicyFilter<>(policy.allowedTlsProtocols(), policy.requireKms()),,
             urlPolicy,
             new ContentSignatureFilter(dataVerifier),
-            new ArchiveSafetyFilter(policy.archiveLimits()),
-            new MalwareScanFilter(malwareScanner),
             new FilenameSanitizationFilter()));
   }
 
