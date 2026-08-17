@@ -3,7 +3,7 @@ package dev.notify.artifact.store;
 import java.time.Instant;
 import java.util.Map;
 
-public interface LogStore {
+public interface LogStore extends Store<LogStore.AuditEvent> {
   void append(AuditEvent event);
 
   record AuditEvent(

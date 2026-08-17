@@ -2,18 +2,15 @@ package dev.notify.artifact;
 
 import dev.notify.artifact.auth.AuthorizationService;
 import dev.notify.artifact.auth.DataVerifier;
+import dev.notify.artifact.dispatcher.JobDispatcher;
+import dev.notify.artifact.dispatcher.QueuingJobDispatcher;
 import dev.notify.artifact.embed.EmbeddingService;
-import dev.notify.artifact.job.ArtifactJobFactory;
-import dev.notify.artifact.job.DefaultArtifactJobFactory;
-import dev.notify.artifact.job.DirectJobDispatcher;
+import dev.notify.artifact.factory.ArtifactJobFactory;
+import dev.notify.artifact.factory.DefaultArtifactJobFactory;
 import dev.notify.artifact.job.Job;
-import dev.notify.artifact.job.JobDispatcher;
 import dev.notify.artifact.model.Artifact;
 import dev.notify.artifact.model.Requests;
-import dev.notify.artifact.security.IngestionSecurityContext;
-import dev.notify.artifact.security.RetrievalSecurityContext;
-import dev.notify.artifact.security.SecurityContextFactory;
-import dev.notify.artifact.security.SecurityFilterChain;
+import dev.notify.artifact.queue.QueueManager;
 import dev.notify.artifact.spool.DurableSpool;
 import dev.notify.artifact.store.MetadataStore;
 import dev.notify.artifact.store.ObjectStore;
@@ -43,6 +40,7 @@ public final class DefaultArtifactEngine implements ArtifactEngine {
       DurableSpool spool,
       DataVerifier verifier,
       EmbeddingService embeddings,
+      QueueManager queueManager, 
       AuthorizationService authorization) {
     this(
         metadata,
@@ -52,7 +50,7 @@ public final class DefaultArtifactEngine implements ArtifactEngine {
         verifier,
         embeddings,
         authorization,
-        EngineOptions.defaults());
+        queueManager, EngineOptions.defaults());
   }
 
   public DefaultArtifactEngine(
@@ -63,33 +61,8 @@ public final class DefaultArtifactEngine implements ArtifactEngine {
       DataVerifier verifier,
       EmbeddingService embeddings,
       AuthorizationService authorization,
+      QueueManager queueManager,
       EngineOptions options) {
-    this(
-        metadata,
-        vectors,
-        objects,
-        spool,
-        verifier,
-        embeddings,
-        authorization,
-        options,
-        null,
-        null,
-        null);
-  }
-
-  public DefaultArtifactEngine(
-      MetadataStore metadata,
-      VectorStore vectors,
-      ObjectStore objects,
-      DurableSpool spool,
-      DataVerifier verifier,
-      EmbeddingService embeddings,
-      AuthorizationService authorization,
-      EngineOptions options,
-      SecurityFilterChain<IngestionSecurityContext> ingestionSecurity,
-      SecurityFilterChain<RetrievalSecurityContext> retrievalSecurity,
-      SecurityContextFactory securityContextFactory) {
     this(
         new DefaultArtifactJobFactory(
             metadata,
@@ -99,11 +72,8 @@ public final class DefaultArtifactEngine implements ArtifactEngine {
             verifier,
             embeddings,
             authorization,
-            options,
-            ingestionSecurity,
-            retrievalSecurity,
-            securityContextFactory),
-        new DirectJobDispatcher());
+            options),
+        new QueuingJobDispatcher(queueManager));
   }
 
   @Override

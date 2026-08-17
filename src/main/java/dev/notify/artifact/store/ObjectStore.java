@@ -3,7 +3,7 @@ package dev.notify.artifact.store;
 import java.io.IOException;
 import java.io.InputStream;
 
-public interface ObjectStore {
+public interface ObjectStore extends Store<InputStream> {
   void put(String tenantId, String key, InputStream content, long length, String sha256)
       throws IOException;
 

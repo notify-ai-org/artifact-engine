@@ -1,15 +1,13 @@
 package dev.notify.artifact.job;
 
 import dev.notify.artifact.EngineOptions;
+import dev.notify.artifact.auth.ArtifactAccessVerifier;
 import dev.notify.artifact.auth.AuthorizationService;
 import dev.notify.artifact.embed.EmbeddingService;
 import dev.notify.artifact.model.Artifact;
 import dev.notify.artifact.model.ArtifactChunk;
 import dev.notify.artifact.model.ArtifactStatus;
 import dev.notify.artifact.model.Requests;
-import dev.notify.artifact.security.RetrievalSecurityContext;
-import dev.notify.artifact.security.SecurityContextFactory;
-import dev.notify.artifact.security.SecurityFilterChain;
 import dev.notify.artifact.store.MetadataStore;
 import dev.notify.artifact.store.VectorStore;
 import java.util.ArrayList;
@@ -22,21 +20,30 @@ import java.util.Objects;
 import java.util.Set;
 
 /** Authorized hybrid retrieval workflow with reciprocal-rank fusion and content sanitization. */
-public record RetrievalJob(
-    Requests.Search request,
-    MetadataStore metadataStore,
-    VectorStore vectorStore,
-    EmbeddingService embeddingService,
-    AuthorizationService authorizationService,
-    EngineOptions options,
-    SecurityFilterChain<RetrievalSecurityContext> retrievalSecurity,
-    SecurityContextFactory securityContextFactory)
-    implements Job<List<Requests.SearchHit>> {
+public final class RetrievalJob extends AbstractJob<List<Requests.SearchHit>> {
+  private final Requests.Search request;
+  private final VectorStore vectorStore;
+  private final EmbeddingService embeddingService;
+  private final ArtifactAccessVerifier accessVerifier;
+  private final EngineOptions options;
+
+  public RetrievalJob(
+      Requests.Search request,
+      MetadataStore metadataStore,
+      VectorStore vectorStore,
+      EmbeddingService embeddingService,
+      ArtifactAccessVerifier accessVerifier,
+      EngineOptions options) {
+    super(accessVerifier, metadataStore);
+    this.request = request;
+    this.vectorStore = vectorStore;
+    this.embeddingService = embeddingService;
+    this.accessVerifier = accessVerifier;
+    this.options = options;
+  }
 
   @Override
   public List<Requests.SearchHit> execute() {
-    authorizationService.require(
-        request.principalId(), request.tenantId(), AuthorizationService.Permission.SEARCH);
     verify(null, null);
 
     float[] queryEmbedding = embeddingService.embed(List.of(request.query())).get(0);
@@ -72,7 +79,7 @@ public record RetrievalJob(
                   .ifPresent(
                       artifact -> {
                         ArtifactChunk securedChunk =
-                            withText(chunk, verify(artifact, chunk.text()).extractedContent());
+                            withText(chunk, verify(artifact, chunk.text()));
                         results.add(
                             new Requests.SearchHit(
                                 artifact,
@@ -84,15 +91,13 @@ public record RetrievalJob(
     return List.copyOf(results);
   }
 
-  private RetrievalSecurityContext verify(Artifact artifact, String extractedContent) {
-    return JobRetrievalAccess.verify(
+  private String verify(Artifact artifact, String extractedContent) {
+    return super.verify(
         request.principalId(),
         request.tenantId(),
         AuthorizationService.Permission.SEARCH,
         artifact,
-        extractedContent,
-        retrievalSecurity,
-        securityContextFactory);
+        extractedContent);
   }
 
   private boolean matchesFilters(Artifact artifact) {

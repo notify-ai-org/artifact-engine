@@ -71,36 +71,19 @@ repeat. Queue completion and retry transitions succeed only for the current, une
 - `mcp`: typed gateway plus a Java MCP SDK 2.x stdio server, tools, and resource templates.
 - `spring`: overridable Spring bean configuration and spool policy defaults.
 
-## Security filter chains
+## Authentication and verification
 
-Security checks are explicit `SecurityFilter` implementations and stop at the first rejection.
-`SecurityFilterException` contains only a safe code, filter name, and non-sensitive message.
+`ArtifactAccessVerifier` is the single security boundary used by artifact jobs. It:
 
-Ingestion order:
+1. requires non-empty trusted principal and tenant identifiers;
+2. delegates permission checks to `AuthorizationService`;
+3. verifies uploaded bytes against the declared media type with `DataVerifier`;
+4. normalizes untrusted filenames;
+5. verifies that loaded artifacts belong to the requested tenant; and
+6. converts extracted HTML to inert plain text before indexing or returning it.
 
-1. `AuthenticationFilter` authenticates the opaque connection/session handle and permission.
-2. `TenantIsolationFilter` matches authenticated, requested, artifact, and hashed storage-key tenants.
-3. `EncryptionPolicyFilter` requires TLS 1.2/1.3 and encrypted, optionally KMS-backed storage.
-4. `ProtocolAbuseFilter` checks frame size, stream transitions, transfer rate, and compression ratio.
-5. `UrlIngestionPolicyFilter` permits only configured schemes/hosts and public resolved addresses.
-6. `ContentSignatureFilter` detects MIME type from bytes.
-7. `ArchiveSafetyFilter` bounds entries, expanded bytes, entry paths, and compression ratios.
-8. `MalwareScanFilter` requires a clean scanner verdict.
-9. `FilenameSanitizationFilter` removes path/control/bidirectional filename content.
-
-Retrieval order is authentication, tenant/storage-key isolation, TLS, protocol checks, clean-scan
-gating, and `ExtractedHtmlSanitizationFilter`. HTML is also reduced to inert text before indexing.
-
-Spring activates the complete layer when the application provides `AuthenticationService`,
-`MalwareScanner`, and `SecurityContextFactory`. The context factory must use trusted transport/session
-facts from the server edge—not headers or fields supplied directly by a remote caller. Configure the
-URL host allowlist with `artifact.security.url.allowed-hosts`; an empty allowlist rejects URL intake.
-The URL connector must connect to one of the IP addresses approved by the filter to prevent DNS
-rebinding. Invoke `ProtocolAbuseFilter` incrementally while receiving frames so slowloris rejection
-does not wait for upload completion.
-
-Spring fails startup when those adapters are missing. Local tests may opt out explicitly with
-`-Dartifact.security.allow-insecure-local=true`; this switch must not be used in a deployed service.
+Spring requires the normal `AuthorizationService` and `DataVerifier` beans and wires this layer
+directly into the job factory. There is no configurable or bypassable filter chain.
 
 ## Infrastructure adapters
 
@@ -138,6 +121,18 @@ artifact.vector.postgres.dimensions=1536
 Import `ArtifactProductionStoreConfiguration` to register these opt-in adapters. Enabling JPA also
 registers the library entities and Spring Data repositories explicitly, so the application does not
 need to widen its component-scan package.
+
+Amazon Textract OCR can be enabled for supported image uploads with:
+
+```properties
+artifact.ocr.textract.enabled=true
+artifact.ocr.textract.max-input-bytes=10485760
+artifact.ocr.max-output-characters=1000000
+```
+
+The default `TextractClient` uses the AWS SDK region and credentials provider chains. Applications
+can instead provide their own `TextractClient` bean. OCR input and output are bounded locally before
+and after the synchronous `DetectDocumentText` request.
 
 S3 uploads stream from the durable spool with an exact content length and never buffer an entire
 artifact. Every operation validates the environment and hashed-tenant key prefix. Upload and read

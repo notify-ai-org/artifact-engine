@@ -1,6 +1,5 @@
-package dev.notify.artifact.store.s3;
+package dev.notify.artifact.store;
 
-import dev.notify.artifact.store.ObjectStore;
 import dev.notify.artifact.util.Checksum;
 import java.io.IOException;
 import java.io.InputStream;

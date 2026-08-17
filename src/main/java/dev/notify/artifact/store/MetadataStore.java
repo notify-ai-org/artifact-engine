@@ -7,7 +7,7 @@ import java.util.List;
 import java.util.Optional;
 import java.util.function.UnaryOperator;
 
-public interface MetadataStore {
+public interface MetadataStore extends Store<Artifact> {
   Artifact save(Artifact artifact);
 
   /** Atomically applies a lifecycle update to the latest persisted version. */

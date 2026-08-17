@@ -11,14 +11,27 @@ import java.io.InputStream;
 import java.util.NoSuchElementException;
 
 /** Uploads a spooled original with a stable key and verifies it before marking it stored. */
-public record StoreJob(
-    String tenantId,
-    String artifactId,
-    MetadataStore metadataStore,
-    ObjectStore objectStore,
-    DurableSpool durableSpool,
-    StorageKeyFactory keyFactory)
-    implements Job<Artifact> {
+public final class StoreJob extends AbstractJob<Artifact> {
+  private final String tenantId;
+  private final String artifactId;
+  private final ObjectStore objectStore;
+  private final DurableSpool durableSpool;
+  private final StorageKeyFactory keyFactory;
+
+  public StoreJob(
+      String tenantId,
+      String artifactId,
+      MetadataStore metadataStore,
+      ObjectStore objectStore,
+      DurableSpool durableSpool,
+      StorageKeyFactory keyFactory) {
+    super(null, metadataStore);
+    this.tenantId = tenantId;
+    this.artifactId = artifactId;
+    this.objectStore = objectStore;
+    this.durableSpool = durableSpool;
+    this.keyFactory = keyFactory;
+  }
 
   @Override
   public Artifact execute() throws IOException {

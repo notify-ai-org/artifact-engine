@@ -1,4 +1,4 @@
-package dev.notify.artifact.store.postgres;
+package dev.notify.artifact.spring.postgres;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;

@@ -14,7 +14,10 @@ public final class PlainTextExtractor implements TextExtractor {
   }
 
   public boolean supports(String type) {
-    return type.startsWith("text/");
+    return type != null
+        && type.startsWith("text/")
+        && !"text/markdown".equalsIgnoreCase(type)
+        && !"text/html".equalsIgnoreCase(type);
   }
 
   public String extract(InputStream content) throws IOException {

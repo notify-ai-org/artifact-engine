@@ -3,13 +3,13 @@ package dev.notify.artifact;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertSame;
 
-import dev.notify.artifact.job.ArtifactJobFactory;
+import dev.notify.artifact.dispatcher.JobDispatcher;
+import dev.notify.artifact.factory.ArtifactJobFactory;
 import dev.notify.artifact.job.DeleteJob;
 import dev.notify.artifact.job.ExtractedTextJob;
 import dev.notify.artifact.job.FetchJob;
 import dev.notify.artifact.job.IngestJob;
 import dev.notify.artifact.job.Job;
-import dev.notify.artifact.job.JobDispatcher;
 import dev.notify.artifact.job.ListMetadataJob;
 import dev.notify.artifact.job.MetadataJob;
 import dev.notify.artifact.job.RetrievalJob;

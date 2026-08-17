@@ -1,6 +1,5 @@
 package dev.notify.artifact.worker;
 
-import dev.notify.artifact.filter.FilterChain;
 import dev.notify.artifact.job.Job;
 import java.io.IOException;
 import java.time.Duration;
@@ -11,6 +10,8 @@ import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.function.Consumer;
 
 /**
  * Owns worker lifecycle and exposes snapshots that a durable implementation can persist/restore.
@@ -23,6 +24,9 @@ public final class WorkerManager implements AutoCloseable {
   private final Map<String, Managed> workers = new ConcurrentHashMap<>();
   private final java.util.function.Consumer<Worker.JobFailure> failureHandler;
   private final WorkerSnapshotStore snapshotStore;
+  private final List<Consumer<Worker.StateChange>> stateChangeListeners =
+      new CopyOnWriteArrayList<>();
+  private final Map<String, Worker.StateChange> latestStateChanges = new ConcurrentHashMap<>();
 
   public WorkerManager(java.util.function.Consumer<Worker.JobFailure> failureHandler) {
     this(failureHandler, null);
@@ -108,12 +112,12 @@ public final class WorkerManager implements AutoCloseable {
             settings.queueCapacity(),
             settings.batchSize(),
             settings.batchBytes(),
-            settings.flushInterval(),
-            new FilterChain<Job<?>>(List.of()),
-            failureHandler);
+            null, null, null, settings.flushInterval(),
+            flushInterval, flushInterval, failureHandler);
     Managed managed = new Managed(worker, settings, Objects.requireNonNull(lastUsed, "lastUsed"));
     if (workers.putIfAbsent(id, managed) != null)
       throw new IllegalArgumentException("Worker exists: " + id);
+    worker.onStateChange(this::handleStateChange);
     worker.start();
     return worker;
   }
@@ -121,19 +125,6 @@ public final class WorkerManager implements AutoCloseable {
   public void remove(String id) {
     Managed managed = workers.remove(id);
     if (managed != null) managed.worker.close();
-  }
-
-  public boolean submit(String workerId, Job<?> job, Duration timeout) throws InterruptedException {
-    Managed managed = workers.get(workerId);
-    if (managed == null) {
-      throw new NoSuchElementException("Worker not found: " + workerId);
-    }
-    boolean accepted = managed.worker.submit(job, timeout);
-    if (accepted) {
-      managed.lastUsed = Instant.now();
-    }
-    // retry
-    return accepted;
   }
 
   public int removeIdle(Duration idle) {
@@ -167,6 +158,29 @@ public final class WorkerManager implements AutoCloseable {
                     m.settings.batchBytes(),
                     m.settings.flushInterval())));
     return Map.copyOf(result);
+  }
+
+  public void addStateChangeListener(Consumer<Worker.StateChange> listener) {
+    stateChangeListeners.add(Objects.requireNonNull(listener, "listener"));
+  }
+
+  public void removeStateChangeListener(Consumer<Worker.StateChange> listener) {
+    stateChangeListeners.remove(Objects.requireNonNull(listener, "listener"));
+  }
+
+  public Map<String, Worker.StateChange> stateChanges() {
+    return Map.copyOf(latestStateChanges);
+  }
+
+  private void handleStateChange(Worker.StateChange stateChange) {
+    latestStateChanges.put(stateChange.jobId(), stateChange);
+    for (Consumer<Worker.StateChange> listener : stateChangeListeners) {
+      try {
+        listener.accept(stateChange);
+      } catch (RuntimeException failure) {
+        failureHandler.accept(new Worker.JobFailure(null, failure));
+      }
+    }
   }
 
   public void close() {

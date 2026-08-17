@@ -1,8 +1,10 @@
-package dev.notify.artifact.security;
+package dev.notify.artifact.auth;
 
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
+
+import dev.notify.artifact.security.SecurityIdentity;
 
 /**
  * Immutable authentication-handle registry suitable for local deployments and tests.

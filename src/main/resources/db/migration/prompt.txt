@@ -30,7 +30,7 @@ Workers
     - Index Job SM .java
 - Worker.java - one for every job type
     Each worker is a thread that accepts incoming jobs and puts them in a local queue
-    Runs validation and sanitization filter chain
+    Runs direct authentication and artifact verification
     flushes job to buffer
     collects batch buffer jobs
     executes the job
@@ -92,7 +92,6 @@ Spring
 Create a project structure similar to above
 Follow guidelines given in ARTIFACT_INTAKE_RAG_MCP_POC.md
 Write neat well documented and intented code
-
 
 
 

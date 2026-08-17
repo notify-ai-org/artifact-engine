@@ -1,15 +1,20 @@
-package dev.notify.artifact.job;
+package dev.notify.artifact.factory;
 
 import dev.notify.artifact.EngineOptions;
 import dev.notify.artifact.auth.AuthorizationService;
+import dev.notify.artifact.auth.ArtifactAccessVerifier;
 import dev.notify.artifact.auth.DataVerifier;
 import dev.notify.artifact.embed.EmbeddingService;
+import dev.notify.artifact.job.DeleteJob;
+import dev.notify.artifact.job.ExtractedTextJob;
+import dev.notify.artifact.job.FetchJob;
+import dev.notify.artifact.job.IngestJob;
+import dev.notify.artifact.job.Job;
+import dev.notify.artifact.job.ListMetadataJob;
+import dev.notify.artifact.job.MetadataJob;
+import dev.notify.artifact.job.RetrievalJob;
 import dev.notify.artifact.model.Artifact;
 import dev.notify.artifact.model.Requests;
-import dev.notify.artifact.security.IngestionSecurityContext;
-import dev.notify.artifact.security.RetrievalSecurityContext;
-import dev.notify.artifact.security.SecurityContextFactory;
-import dev.notify.artifact.security.SecurityFilterChain;
 import dev.notify.artifact.spool.DurableSpool;
 import dev.notify.artifact.store.MetadataStore;
 import dev.notify.artifact.store.ObjectStore;
@@ -24,13 +29,9 @@ public final class DefaultArtifactJobFactory implements ArtifactJobFactory {
   private final VectorStore vectorStore;
   private final ObjectStore objectStore;
   private final DurableSpool durableSpool;
-  private final DataVerifier dataVerifier;
   private final EmbeddingService embeddingService;
-  private final AuthorizationService authorizationService;
+  private final ArtifactAccessVerifier accessVerifier;
   private final EngineOptions options;
-  private final SecurityFilterChain<IngestionSecurityContext> ingestionSecurity;
-  private final SecurityFilterChain<RetrievalSecurityContext> retrievalSecurity;
-  private final SecurityContextFactory securityContextFactory;
 
   public DefaultArtifactJobFactory(
       MetadataStore metadataStore,
@@ -40,27 +41,17 @@ public final class DefaultArtifactJobFactory implements ArtifactJobFactory {
       DataVerifier dataVerifier,
       EmbeddingService embeddingService,
       AuthorizationService authorizationService,
-      EngineOptions options,
-      SecurityFilterChain<IngestionSecurityContext> ingestionSecurity,
-      SecurityFilterChain<RetrievalSecurityContext> retrievalSecurity,
-      SecurityContextFactory securityContextFactory) {
+      EngineOptions options) {
     this.metadataStore = Objects.requireNonNull(metadataStore, "metadataStore");
     this.vectorStore = Objects.requireNonNull(vectorStore, "vectorStore");
     this.objectStore = Objects.requireNonNull(objectStore, "objectStore");
     this.durableSpool = Objects.requireNonNull(durableSpool, "durableSpool");
-    this.dataVerifier = Objects.requireNonNull(dataVerifier, "dataVerifier");
+    Objects.requireNonNull(dataVerifier, "dataVerifier");
     this.embeddingService = Objects.requireNonNull(embeddingService, "embeddingService");
-    this.authorizationService =
-        Objects.requireNonNull(authorizationService, "authorizationService");
+    this.accessVerifier =
+        new ArtifactAccessVerifier(
+            Objects.requireNonNull(authorizationService, "authorizationService"), dataVerifier);
     this.options = Objects.requireNonNull(options, "options");
-    this.ingestionSecurity = ingestionSecurity;
-    this.retrievalSecurity = retrievalSecurity;
-    this.securityContextFactory = securityContextFactory;
-    if ((ingestionSecurity == null) != (securityContextFactory == null)
-        || (retrievalSecurity == null) != (securityContextFactory == null)) {
-      throw new IllegalArgumentException(
-          "Security chains and context factory must be configured together");
-    }
   }
 
   @Override
@@ -69,11 +60,8 @@ public final class DefaultArtifactJobFactory implements ArtifactJobFactory {
         request,
         metadataStore,
         durableSpool,
-        dataVerifier,
-        authorizationService,
-        options,
-        ingestionSecurity,
-        securityContextFactory);
+        accessVerifier,
+        options);
   }
 
   @Override
@@ -83,15 +71,14 @@ public final class DefaultArtifactJobFactory implements ArtifactJobFactory {
         tenantId,
         artifactId,
         metadataStore,
-        authorizationService,
-        retrievalSecurity,
-        securityContextFactory);
+        accessVerifier);
   }
 
   @Override
   public Job<List<Artifact>> createListMetadata(
       String principalId, String tenantId, int limit) {
-    return new ListMetadataJob(principalId, tenantId, limit, metadataStore, authorizationService);
+    return new ListMetadataJob(
+        principalId, tenantId, limit, metadataStore, accessVerifier);
   }
 
   @Override
@@ -103,9 +90,7 @@ public final class DefaultArtifactJobFactory implements ArtifactJobFactory {
         metadataStore,
         objectStore,
         durableSpool,
-        authorizationService,
-        retrievalSecurity,
-        securityContextFactory);
+        accessVerifier);
   }
 
   @Override
@@ -118,9 +103,7 @@ public final class DefaultArtifactJobFactory implements ArtifactJobFactory {
         maxCharacters,
         metadataStore,
         vectorStore,
-        authorizationService,
-        retrievalSecurity,
-        securityContextFactory);
+        accessVerifier);
   }
 
   @Override
@@ -130,10 +113,8 @@ public final class DefaultArtifactJobFactory implements ArtifactJobFactory {
         metadataStore,
         vectorStore,
         embeddingService,
-        authorizationService,
-        options,
-        retrievalSecurity,
-        securityContextFactory);
+        accessVerifier,
+        options);
   }
 
   @Override
@@ -146,6 +127,6 @@ public final class DefaultArtifactJobFactory implements ArtifactJobFactory {
         vectorStore,
         objectStore,
         durableSpool,
-        authorizationService);
+        accessVerifier);
   }
 }

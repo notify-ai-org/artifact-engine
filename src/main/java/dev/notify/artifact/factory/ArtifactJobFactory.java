@@ -1,5 +1,6 @@
-package dev.notify.artifact.job;
+package dev.notify.artifact.factory;
 
+import dev.notify.artifact.job.Job;
 import dev.notify.artifact.model.Artifact;
 import dev.notify.artifact.model.Requests;
 import java.io.InputStream;

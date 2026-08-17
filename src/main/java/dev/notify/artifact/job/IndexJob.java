@@ -3,11 +3,10 @@ package dev.notify.artifact.job;
 import dev.notify.artifact.embed.EmbeddingService;
 import dev.notify.artifact.extract.Ocr;
 import dev.notify.artifact.extract.TextExtractor;
+import dev.notify.artifact.extract.TextExtractorFactory;
 import dev.notify.artifact.model.Artifact;
 import dev.notify.artifact.model.ArtifactChunk;
 import dev.notify.artifact.model.ArtifactStatus;
-import dev.notify.artifact.security.ExtractedHtmlSanitizationFilter;
-import dev.notify.artifact.security.IndexingContentContext;
 import dev.notify.artifact.spool.DurableSpool;
 import dev.notify.artifact.store.MetadataStore;
 import dev.notify.artifact.store.ObjectStore;
@@ -21,21 +20,62 @@ import java.util.Map;
 import java.util.NoSuchElementException;
 
 /** Restart-safe indexing pipeline with deterministic chunk/vector identities. */
-public record IndexJob(
-    String tenantId,
-    String artifactId,
-    MetadataStore metadataStore,
-    ObjectStore objectStore,
-    DurableSpool durableSpool,
-    List<TextExtractor> extractors,
-    Ocr ocr,
-    Chunker chunker,
-    EmbeddingService embeddingService,
-    VectorStore vectorStore)
-    implements Job<Integer> {
+public final class IndexJob extends AbstractJob<Integer> {
+  private final String tenantId;
+  private final String artifactId;
+  private final ObjectStore objectStore;
+  private final DurableSpool durableSpool;
+  private final TextExtractorFactory extractorFactory;
+  private final Ocr ocr;
+  private final Chunker chunker;
+  private final EmbeddingService embeddingService;
+  private final VectorStore vectorStore;
 
-  public IndexJob {
-    extractors = List.copyOf(extractors);
+  public IndexJob(
+      String tenantId,
+      String artifactId,
+      MetadataStore metadataStore,
+      ObjectStore objectStore,
+      DurableSpool durableSpool,
+      List<TextExtractor> extractors,
+      Ocr ocr,
+      Chunker chunker,
+      EmbeddingService embeddingService,
+      VectorStore vectorStore) {
+    this(
+        tenantId,
+        artifactId,
+        metadataStore,
+        objectStore,
+        durableSpool,
+        new TextExtractorFactory(extractors),
+        ocr,
+        chunker,
+        embeddingService,
+        vectorStore);
+  }
+
+  public IndexJob(
+      String tenantId,
+      String artifactId,
+      MetadataStore metadataStore,
+      ObjectStore objectStore,
+      DurableSpool durableSpool,
+      TextExtractorFactory extractorFactory,
+      Ocr ocr,
+      Chunker chunker,
+      EmbeddingService embeddingService,
+      VectorStore vectorStore) {
+    super(null, metadataStore);
+    this.tenantId = tenantId;
+    this.artifactId = artifactId;
+    this.objectStore = objectStore;
+    this.durableSpool = durableSpool;
+    this.extractorFactory = java.util.Objects.requireNonNull(extractorFactory, "extractorFactory");
+    this.ocr = ocr;
+    this.chunker = chunker;
+    this.embeddingService = embeddingService;
+    this.vectorStore = vectorStore;
   }
 
   @Override
@@ -44,11 +84,6 @@ public record IndexJob(
     try {
       updateIndex(ArtifactStatus.Index.EXTRACTING);
       String extractedText = extract(artifact);
-      IndexingContentContext contentSecurity =
-          new IndexingContentContext(artifact.mediaType(), extractedText);
-      new ExtractedHtmlSanitizationFilter<IndexingContentContext>().verify(contentSecurity);
-      extractedText = contentSecurity.extractedContent();
-
       updateIndex(ArtifactStatus.Index.CHUNKING);
       List<String> chunkTexts = chunker.chunk(extractedText);
 
@@ -75,9 +110,7 @@ public record IndexJob(
   private String extract(Artifact artifact) throws IOException {
     try (InputStream content = openContent(artifact)) {
       var nativeExtractor =
-          extractors.stream()
-              .filter(extractor -> extractor.supports(artifact.mediaType()))
-              .findFirst();
+          extractorFactory.find(artifact.mediaType());
       if (nativeExtractor.isPresent()) {
         String text = nativeExtractor.get().extract(content);
         if (!text.isBlank()) {

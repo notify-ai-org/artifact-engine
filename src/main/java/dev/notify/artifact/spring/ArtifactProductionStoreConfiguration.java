@@ -1,10 +1,12 @@
 package dev.notify.artifact.spring;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+
+import dev.notify.artifact.spring.postgres.PostgresVectorStore;
 import dev.notify.artifact.store.ObjectStore;
 import dev.notify.artifact.store.VectorStore;
-import dev.notify.artifact.store.postgres.PostgresVectorStore;
-import dev.notify.artifact.store.s3.S3ObjectStore;
+import dev.notify.artifact.store.S3ObjectStore;
+
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;

@@ -1,11 +1,18 @@
 package dev.notify.artifact.worker;
 
-import dev.notify.artifact.filter.FilterChain;
 import dev.notify.artifact.job.Job;
+import dev.notify.artifact.model.JobRecord;
+import dev.notify.artifact.queue.JobQueue;
+import dev.notify.artifact.retry.RetryPolicy;
+
 import java.time.Duration;
+import java.time.Instant;
 import java.util.List;
-import java.util.concurrent.ArrayBlockingQueue;
-import java.util.concurrent.BlockingQueue;
+import java.util.Objects;
+import java.util.UUID;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
@@ -13,46 +20,77 @@ import java.util.function.Consumer;
 /** Single-threaded bounded worker. Backpressure is explicit: submit returns false when full. */
 public final class Worker implements AutoCloseable {
   private final String id;
-  private final BlockingQueue<Job<?>> incoming;
-  private final FilterChain<Job<?>> filters;
+  private final int queueCapacity;
   private final Buffer<Job<?>> buffer;
+  private volatile JobRecord activeJob;
+  private Thread workerThread;
+
+  private final String owner = UUID.randomUUID().toString();
+  private final JobRecord.JobType type;
+  private final JobQueue queue;
+  private final RetryPolicy retryPolicy;
+  private final Duration leaseDuration;
+  private final Duration idlePollInterval;
   private final Consumer<JobFailure> failureHandler;
   private final AtomicBoolean running = new AtomicBoolean();
-  private Thread thread;
+  private final ScheduledExecutorService heartbeat;
+  private final java.util.Map<String, StateMachine<JobStateMachines.State>> stateMachines =
+      new ConcurrentHashMap<>();
+  private volatile Consumer<StateChange> stateChangeListener = ignored -> {};
 
   public Worker(
       String id,
       int queueCapacity,
       int batchSize,
       long batchBytes,
+      JobRecord.JobType type,
+      JobQueue queue,
+      RetryPolicy retryPolicy,
+      Duration leaseDuration,
+      Duration idlePollInterval,
       Duration flushInterval,
-      FilterChain<Job<?>> filters,
       Consumer<JobFailure> failureHandler) {
     this.id = id;
-    this.incoming = new ArrayBlockingQueue<>(queueCapacity);
-    this.filters = filters;
+    this.queueCapacity = queueCapacity;
     this.buffer = new Buffer<>(batchSize, batchBytes, flushInterval);
-    this.failureHandler = failureHandler;
+    this.type = Objects.requireNonNull(type, "type");
+    this.queue = Objects.requireNonNull(queue, "queue");
+    this.retryPolicy = Objects.requireNonNull(retryPolicy, "retryPolicy");
+    this.leaseDuration = Objects.requireNonNull(leaseDuration, "leaseDuration");
+    this.idlePollInterval = Objects.requireNonNull(idlePollInterval, "idlePollInterval");
+    this.failureHandler = Objects.requireNonNull(failureHandler, "failureHandler");
+    if (leaseDuration.isZero() || leaseDuration.isNegative()) {
+      throw new IllegalArgumentException("leaseDuration must be positive");
+    }
+    this.heartbeat =
+        Executors.newSingleThreadScheduledExecutor(
+            runnable -> {
+              Thread thread = new Thread(runnable, "artifact-lease-heartbeat-" + type);
+              thread.setDaemon(true);
+              return thread;
+            });
   }
 
   public synchronized void start() {
-    if (running.compareAndSet(false, true)) {
-      thread = new Thread(this::run, "artifact-worker-" + id);
-      thread.start();
+    if (!running.compareAndSet(false, true)) {
+      return;
     }
-  }
-
-  public boolean submit(Job<?> job, Duration timeout) throws InterruptedException {
-    return incoming.offer(job, timeout.toMillis(), TimeUnit.MILLISECONDS);
+    long heartbeatMillis = Math.max(100, leaseDuration.toMillis() / 3);
+    heartbeat.scheduleWithFixedDelay(
+        this::renewActiveLease, heartbeatMillis, heartbeatMillis, TimeUnit.MILLISECONDS);
+    workerThread = new Thread(this::run, "artifact-durable-worker-" + type + "-" + owner);
+    workerThread.start();
   }
 
   private void run() {
-    while (running.get() || !incoming.isEmpty()) {
+    while (running.get()) {
       try {
-        Job<?> job = incoming.poll(100, TimeUnit.MILLISECONDS);
-        if (job != null) {
-          addToBuffer(filters.apply(job));
+        var claimed = queue.claim(type, owner, leaseDuration, Instant.now());
+        if (claimed.isEmpty()) {
+          Thread.sleep(idlePollInterval.toMillis());
+          continue;
         }
+        execute(claimed.get());
         if (buffer.shouldFlush()) {
           execute(buffer.drain());
         }
@@ -61,6 +99,8 @@ public final class Worker implements AutoCloseable {
           Thread.currentThread().interrupt();
           break;
         }
+      } catch (RuntimeException infrastructureFailure) {
+        failureHandler.accept(new JobFailure(null, infrastructureFailure));
       }
     }
     execute(buffer.drain());
@@ -86,22 +126,107 @@ public final class Worker implements AutoCloseable {
     }
   }
 
+  private void execute(JobRecord job) {
+    StateMachine<JobStateMachines.State> stateMachine = stateMachine(job.type());
+    stateMachine.onTransition(
+        transition ->
+            stateChangeListener.accept(new StateChange(id, job.id(), job.type(), transition)));
+    stateMachines.put(job.id(), stateMachine);
+    activeJob = job;
+    try {
+      stateMachine.transition(JobStateMachines.State.VALIDATING, "job claimed");
+      stateMachine.transition(JobStateMachines.State.BUFFERED, "job validated");
+      stateMachine.transition(JobStateMachines.State.RUNNING, "job execution started");
+      if (!queue.complete(job.id(), owner)) {
+        failureHandler.accept(
+            new JobFailure(
+                null, new IllegalStateException("Completion rejected for job " + job.id())));
+      } else {
+        stateMachine.transition(JobStateMachines.State.COMPLETED, "job completed");
+      }
+    } catch (Exception failure) {
+      failureHandler.accept(new JobFailure(null, failure));
+      if (job.attempts() >= retryPolicy.maxAttempts()) {
+        queue.deadLetter(job.id(), owner, safeMessage(failure));
+        stateMachine.transition(JobStateMachines.State.DEAD_LETTER, safeMessage(failure));
+      } else {
+        Instant retryAt = Instant.now().plus(retryPolicy.delay(job.attempts()));
+        queue.retry(job.id(), owner, retryAt, safeMessage(failure));
+        stateMachine.transition(JobStateMachines.State.RETRY_PENDING, safeMessage(failure));
+      }
+    } finally {
+      activeJob = null;
+    }
+  }
+
+  private void renewActiveLease() {
+    JobRecord job = activeJob;
+    if (job == null) {
+      return;
+    }
+    try {
+      if (!queue.renew(job.id(), owner, leaseDuration, Instant.now())) {
+        failureHandler.accept(
+            new JobFailure(
+                null, new IllegalStateException("Lease renewal rejected for job " + job.id())));
+      }
+    } catch (RuntimeException failure) {
+      failureHandler.accept(new JobFailure(null, failure));
+    }
+  }
+
+  @Override
+  public synchronized void close() {
+    running.set(false);
+    heartbeat.shutdownNow();
+    if (workerThread != null) {
+      workerThread.interrupt();
+    }
+  }
+
+  private static String safeMessage(Exception failure) {
+    String message = failure.getMessage();
+    return message == null
+        ? failure.getClass().getSimpleName()
+        : message.substring(0, Math.min(500, message.length()));
+  }
+
   public String id() {
     return id;
   }
 
   public int queued() {
-    return incoming.size();
+    return 0;
   }
 
   public int capacity() {
-    return incoming.size() + incoming.remainingCapacity();
+    return queueCapacity;
   }
 
-  public void close() {
-    running.set(false);
-    if (thread != null) thread.interrupt();
+  public void onStateChange(Consumer<StateChange> listener) {
+    stateChangeListener = Objects.requireNonNull(listener, "listener");
+  }
+
+  public java.util.Map<String, JobStateMachines.State> states() {
+    java.util.Map<String, JobStateMachines.State> states = new java.util.HashMap<>();
+    stateMachines.forEach((jobId, stateMachine) -> states.put(jobId, stateMachine.state()));
+    return java.util.Map.copyOf(states);
+  }
+
+  private static StateMachine<JobStateMachines.State> stateMachine(JobRecord.JobType type) {
+    return switch (type) {
+      case INGEST, STORE -> new JobStateMachines.Ingest();
+      case FETCH -> new JobStateMachines.Fetch();
+      case INDEX -> new JobStateMachines.Index();
+      case RETRIEVAL -> new JobStateMachines.Retrieval();
+    };
   }
 
   public record JobFailure(Job<?> job, Exception cause) {}
+
+  public record StateChange(
+      String workerId,
+      String jobId,
+      JobRecord.JobType jobType,
+      StateMachine.Transition<JobStateMachines.State> transition) {}
 }

@@ -3,7 +3,7 @@ package dev.notify.artifact.store;
 import dev.notify.artifact.model.ArtifactChunk;
 import java.util.List;
 
-public interface VectorStore {
+public interface VectorStore extends Store<ArtifactChunk> {
   void upsert(ArtifactChunk chunk);
 
   List<ScoredChunk> search(String tenantId, float[] query, int limit, SearchFilter filter);

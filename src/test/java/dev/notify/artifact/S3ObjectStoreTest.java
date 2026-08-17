@@ -7,7 +7,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
-import dev.notify.artifact.store.s3.S3ObjectStore;
+import dev.notify.artifact.store.S3ObjectStore;
 import dev.notify.artifact.util.Checksum;
 import java.io.ByteArrayInputStream;
 import java.util.Base64;

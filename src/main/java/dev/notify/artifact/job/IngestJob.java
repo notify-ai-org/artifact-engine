@@ -1,16 +1,11 @@
 package dev.notify.artifact.job;
 
 import dev.notify.artifact.EngineOptions;
-import dev.notify.artifact.auth.AuthorizationService;
-import dev.notify.artifact.auth.DataVerifier;
+import dev.notify.artifact.auth.ArtifactAccessVerifier;
 import dev.notify.artifact.model.Artifact;
 import dev.notify.artifact.model.ArtifactStatus;
 import dev.notify.artifact.model.JobRecord;
 import dev.notify.artifact.model.Requests;
-import dev.notify.artifact.security.IngestionSecurityContext;
-import dev.notify.artifact.security.RetrievalScanGateFilter;
-import dev.notify.artifact.security.SecurityContextFactory;
-import dev.notify.artifact.security.SecurityFilterChain;
 import dev.notify.artifact.spool.DurableSpool;
 import dev.notify.artifact.store.MetadataStore;
 import dev.notify.artifact.util.Checksum;
@@ -24,22 +19,27 @@ import java.util.UUID;
 /**
  * Durable intake workflow: authorize, spool, verify, register metadata, and publish outbox jobs.
  */
-public record IngestJob(
-    Requests.Ingest request,
-    MetadataStore metadataStore,
-    DurableSpool durableSpool,
-    DataVerifier dataVerifier,
-    AuthorizationService authorizationService,
-    EngineOptions options,
-    SecurityFilterChain<IngestionSecurityContext> ingestionSecurity,
-    SecurityContextFactory securityContextFactory)
-    implements Job<Artifact> {
+public final class IngestJob extends AbstractJob<Artifact> {
+  private final Requests.Ingest request;
+  private final DurableSpool durableSpool;
+  private final ArtifactAccessVerifier accessVerifier;
+  private final EngineOptions options;
+
+  public IngestJob(
+      Requests.Ingest request,
+      MetadataStore metadataStore,
+      DurableSpool durableSpool,
+      ArtifactAccessVerifier accessVerifier,
+      EngineOptions options) {
+    super(accessVerifier, metadataStore);
+    this.request = request;
+    this.durableSpool = durableSpool;
+    this.accessVerifier = accessVerifier;
+    this.options = options;
+  }
 
   @Override
   public Artifact execute() throws IOException {
-    authorizationService.require(
-        request.principalId(), request.tenantId(), AuthorizationService.Permission.INGEST);
-
     String artifactId = UUID.randomUUID().toString();
     DurableSpool.SpoolEntry spoolEntry =
         durableSpool.write(request.tenantId(), artifactId, request.content(), request.metadata());
@@ -47,25 +47,15 @@ public record IngestJob(
     String sanitizedFilename;
     Map<String, String> securedMetadata = new java.util.TreeMap<>(request.metadata());
     try {
-      if (ingestionSecurity != null) {
-        IngestionSecurityContext securityContext =
-            securityContextFactory.ingestion(request, spoolEntry.contentPath());
-        ingestionSecurity.verify(securityContext);
-        detectedMediaType = securityContext.detectedMediaType();
-        sanitizedFilename = securityContext.sanitizedFilename();
-        if (detectedMediaType == null
-            || sanitizedFilename == null
-            || securityContext.scanVerdict() == null) {
-          throw new IllegalStateException(
-              "Ingestion security chain did not produce all required decisions");
-        }
-        securedMetadata.put(
-            RetrievalScanGateFilter.SCAN_STATUS_METADATA, securityContext.scanVerdict().name());
-      } else {
-        detectedMediaType =
-            dataVerifier.verify(spoolEntry.contentPath(), request.declaredMediaType());
-        sanitizedFilename = sanitizeName(request.originalName());
-      }
+      ArtifactAccessVerifier.VerifiedIngestion verified =
+          accessVerifier.verifyIngestion(
+              request.principalId(),
+              request.tenantId(),
+              spoolEntry.contentPath(),
+              request.declaredMediaType(),
+              request.originalName());
+      detectedMediaType = verified.detectedMediaType();
+      sanitizedFilename = verified.sanitizedFilename();
     } catch (IOException | RuntimeException verificationFailure) {
       discardFailedIntake(spoolEntry.contentPath(), verificationFailure);
       throw verificationFailure;
@@ -161,13 +151,5 @@ public record IngestJob(
     fingerprint.put("originalName", sanitizedFilename);
     fingerprint.put("mediaType", detectedMediaType);
     return fingerprint;
-  }
-
-  private static String sanitizeName(String name) {
-    if (name == null || name.isBlank()) {
-      return "artifact";
-    }
-    String sanitizedName = name.replaceAll("[\\r\\n\\u0000]", "_");
-    return sanitizedName.substring(0, Math.min(255, sanitizedName.length()));
   }
 }

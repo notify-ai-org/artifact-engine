@@ -9,8 +9,10 @@ import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+
+import dev.notify.artifact.spring.postgres.PostgresVectorStore;
 import dev.notify.artifact.store.VectorStore;
-import dev.notify.artifact.store.postgres.PostgresVectorStore;
+
 import java.util.List;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;

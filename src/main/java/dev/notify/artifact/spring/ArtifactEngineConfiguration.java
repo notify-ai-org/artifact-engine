@@ -6,12 +6,15 @@ import dev.notify.artifact.DefaultArtifactEngine;
 import dev.notify.artifact.EngineOptions;
 import dev.notify.artifact.auth.AuthorizationService;
 import dev.notify.artifact.auth.DataVerifier;
+import dev.notify.artifact.dispatcher.JobDispatcher;
+import dev.notify.artifact.dispatcher.QueuingJobDispatcher;
 import dev.notify.artifact.embed.EmbeddingService;
-import dev.notify.artifact.job.ArtifactJobFactory;
-import dev.notify.artifact.job.DefaultArtifactJobFactory;
-import dev.notify.artifact.job.DirectJobDispatcher;
-import dev.notify.artifact.job.JobDispatcher;
-import dev.notify.artifact.security.ArtifactSecurity;
+import dev.notify.artifact.extract.AwsTextractOcr;
+import dev.notify.artifact.extract.Ocr;
+import dev.notify.artifact.extract.TextExtractorFactory;
+import dev.notify.artifact.factory.ArtifactJobFactory;
+import dev.notify.artifact.factory.DefaultArtifactJobFactory;
+import dev.notify.artifact.queue.QueueManager;
 import dev.notify.artifact.spool.DurableSpool;
 import dev.notify.artifact.store.InMemoryStores;
 import dev.notify.artifact.store.MetadataStore;
@@ -19,10 +22,13 @@ import dev.notify.artifact.store.ObjectStore;
 import dev.notify.artifact.store.VectorStore;
 import java.io.IOException;
 import java.nio.file.Path;
-import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import software.amazon.awssdk.services.textract.TextractClient;
 
 /**
  * Minimal Spring edge configuration. Applications override store/provider/auth beans for
@@ -30,6 +36,14 @@ import org.springframework.context.annotation.Configuration;
  */
 @Configuration(proxyBeanMethods = false)
 public class ArtifactEngineConfiguration {
+  @Bean(destroyMethod = "close")
+  @ConditionalOnMissingBean(TextractClient.class)
+  @ConditionalOnProperty(
+      prefix = "artifact.ocr.textract", name = "enabled", havingValue = "true")
+  public TextractClient artifactTextractClient() {
+    return TextractClient.create();
+  }
+
   @Bean
   @ConditionalOnMissingBean(MetadataStore.class)
   public MetadataStore artifactMetadataStore() {
@@ -46,6 +60,24 @@ public class ArtifactEngineConfiguration {
   @ConditionalOnMissingBean(DataVerifier.class)
   public DataVerifier artifactDataVerifier() {
     return new DataVerifier();
+  }
+
+  @Bean
+  @ConditionalOnMissingBean(Ocr.class)
+  @ConditionalOnBean(TextractClient.class)
+  public Ocr artifactTextractOcr(
+      TextractClient textractClient,
+      @Value("${artifact.ocr.textract.max-input-bytes:10485760}") int maxInputBytes,
+      @Value("${artifact.ocr.max-output-characters:1000000}") int maxOutputCharacters) {
+    return new AwsTextractOcr(textractClient, maxInputBytes, maxOutputCharacters);
+  }
+
+  @Bean
+  @ConditionalOnMissingBean(TextExtractorFactory.class)
+  public TextExtractorFactory artifactTextExtractorFactory(
+      @Value("${artifact.extract.max-input-bytes:134217728}") int maxInputBytes,
+      @Value("${artifact.extract.max-output-characters:1000000}") int maxOutputCharacters) {
+    return TextExtractorFactory.defaults(maxInputBytes, maxOutputCharacters);
   }
 
   @Bean
@@ -73,8 +105,8 @@ public class ArtifactEngineConfiguration {
 
   @Bean
   @ConditionalOnMissingBean(JobDispatcher.class)
-  public JobDispatcher artifactJobDispatcher() {
-    return new DirectJobDispatcher();
+  public JobDispatcher artifactJobDispatcher(QueueManager queueManager) {
+    return new QueuingJobDispatcher(queueManager);
   }
 
   @Bean
@@ -87,31 +119,9 @@ public class ArtifactEngineConfiguration {
       DataVerifier verifier,
       EmbeddingService embeddings,
       AuthorizationService auth,
-      EngineOptions options,
-      ObjectProvider<ArtifactSecurity> securityProvider) {
-    ArtifactSecurity security = securityProvider.getIfAvailable();
-    if (security == null) {
-      if (!Boolean.getBoolean("artifact.security.allow-insecure-local")) {
-        throw new IllegalStateException(
-            "Artifact security adapters are missing. Configure AuthenticationService, "
-                + "MalwareScanner, and SecurityContextFactory, or explicitly enable the "
-                + "insecure local-development mode.");
-      }
-      return new DefaultArtifactJobFactory(
-          metadata, vectors, objects, spool, verifier, embeddings, auth, options, null, null, null);
-    }
+      EngineOptions options) {
     return new DefaultArtifactJobFactory(
-        metadata,
-        vectors,
-        objects,
-        spool,
-        verifier,
-        embeddings,
-        auth,
-        options,
-        security.ingestion(),
-        security.retrieval(),
-        security.contextFactory());
+        metadata, vectors, objects, spool, verifier, embeddings, auth, options);
   }
 
   @Bean

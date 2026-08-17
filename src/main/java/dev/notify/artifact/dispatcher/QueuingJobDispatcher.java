@@ -1,5 +1,7 @@
-package dev.notify.artifact.job;
+package dev.notify.artifact.dispatcher;
 
+import dev.notify.artifact.job.Job;
+import dev.notify.artifact.job.QueueableJob;
 import dev.notify.artifact.model.JobRecord;
 import dev.notify.artifact.queue.QueueManager;
 import java.util.Objects;
@@ -14,28 +16,14 @@ import java.util.Objects;
  */
 public final class QueuingJobDispatcher implements JobDispatcher {
   private final QueueManager queueManager;
-  private final JobDispatcher inlineDispatcher;
-
+  
   public QueuingJobDispatcher(QueueManager queueManager) {
-    this(queueManager, new DirectJobDispatcher());
-  }
-
-  public QueuingJobDispatcher(QueueManager queueManager, JobDispatcher inlineDispatcher) {
     this.queueManager = Objects.requireNonNull(queueManager, "queueManager");
-    this.inlineDispatcher = Objects.requireNonNull(inlineDispatcher, "inlineDispatcher");
-    if (inlineDispatcher == this) {
-      throw new IllegalArgumentException("inlineDispatcher cannot delegate to itself");
-    }
   }
 
   @Override
   public <R> R dispatch(Job<R> job) throws Exception {
     Objects.requireNonNull(job, "job");
-    if (!(job instanceof QueueableJob<?>)) {
-      return inlineDispatcher.dispatch(job);
-    }
-
-    @SuppressWarnings("unchecked")
     QueueableJob<R> queueableJob = (QueueableJob<R>) job;
     JobRecord record = requirePending(queueableJob.queueRecord());
     queueManager.enqueue(record);

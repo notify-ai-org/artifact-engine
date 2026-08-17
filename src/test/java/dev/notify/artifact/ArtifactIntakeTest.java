@@ -5,10 +5,13 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.notify.artifact.auth.DataVerifier;
+import dev.notify.artifact.dispatcher.JobDispatcher;
 import dev.notify.artifact.embed.EmbeddingCache;
 import dev.notify.artifact.embed.EmbeddingProvider;
 import dev.notify.artifact.embed.EmbeddingService;
 import dev.notify.artifact.exception.IdempotencyConflictException;
+import dev.notify.artifact.factory.DefaultArtifactJobFactory;
+import dev.notify.artifact.job.Job;
 import dev.notify.artifact.model.JobRecord;
 import dev.notify.artifact.model.Requests;
 import dev.notify.artifact.queue.InMemoryJobQueue;
@@ -41,8 +44,8 @@ class ArtifactIntakeTest {
   void setUp() throws IOException {
     metadataStore = new InMemoryStores.Metadata();
     spool = new DurableSpool(spoolRoot, 1024, new ObjectMapper());
-    engine =
-        new DefaultArtifactEngine(
+    var jobFactory =
+        new DefaultArtifactJobFactory(
             metadataStore,
             new InMemoryStores.Vectors(),
             unusedObjectStore(),
@@ -51,6 +54,15 @@ class ArtifactIntakeTest {
             embeddingService(),
             (principal, tenant, permission) -> {},
             EngineOptions.defaults());
+    engine =
+        new DefaultArtifactEngine(
+            jobFactory,
+            new JobDispatcher() {
+              @Override
+              public <R> R dispatch(Job<R> job) throws Exception {
+                return job.execute();
+              }
+            });
   }
 
   @Test
