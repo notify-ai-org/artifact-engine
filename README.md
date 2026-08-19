@@ -163,7 +163,7 @@ schemas intentionally do not accept those fields. The launcher reserves stdout s
 JSON-RPC and redirects ordinary `System.out` output to stderr.
 
 The reusable server can be constructed directly with an `ArtifactEngine`. To use the standalone
-`ArtifactMcpStdioMain`, a deployment jar must register exactly one
+`ArtifactMcpStdioMain`, the module registers a default
 `dev.notify.artifact.mcp.stdio.ArtifactMcpEngineProvider` in:
 
 ```text
@@ -177,6 +177,53 @@ ARTIFACT_MCP_PRINCIPAL_ID
 ARTIFACT_MCP_TENANT_ID
 ARTIFACT_MCP_SCOPES
 ```
+
+The launcher resolves configuration, in descending precedence, from command-line options, OS
+environment variables, and `src/main/resources/artifact-mcp.properties`. Command-line options may
+use either `--KEY=value` or `--KEY value` syntax. For example:
+
+```bash
+java -jar artifact-engine.jar --ARTIFACT_MCP_TENANT_ID=tenant-a \
+  --ARTIFACT_MCP_PRINCIPAL_ID principal-a \
+  --ARTIFACT_MCP_SCOPES artifact.search,artifact.metadata
+```
+
+The default S3 store requires `ARTIFACT_S3_BUCKET` and `ARTIFACT_S3_KMS_KEY_ID`. Optional S3 keys
+are `ARTIFACT_S3_REGION`, `ARTIFACT_S3_ENVIRONMENT`,
+`ARTIFACT_S3_EXPECTED_BUCKET_OWNER`, and `ARTIFACT_S3_BUCKET_KEY_ENABLED`.
+
+The default provider uses Jdbi and HikariCP for PostgreSQL metadata and vector stores when either
+`ARTIFACT_JDBC_URL` or `JDBC_DATABASE_URL` is set. Otherwise, it starts with process-local stores.
+The JDBC configuration is:
+
+```text
+ARTIFACT_JDBC_URL=jdbc:postgresql://127.0.0.1:5432/notify_db
+ARTIFACT_JDBC_USER=notification_user
+ARTIFACT_JDBC_PASSWORD=...
+ARTIFACT_JDBC_MAX_POOL_SIZE=8
+ARTIFACT_JDBC_MIN_IDLE=1
+ARTIFACT_VECTOR_DIMENSIONS=1536
+```
+
+`DB_USER` and `DB_PASSWORD` are accepted as credential fallbacks. Apply
+`db/migration/V1__artifact_engine.sql` before starting the JDBC-backed provider. The configured
+vector dimensions must match the migration's `vector(N)` declaration.
+
+Embeddings use an OpenAI-compatible HTTP endpoint through a shared OkHttp client:
+
+```text
+EMBEDDING_BASE_URL=https://api.openai.com/v1
+EMBEDDING_API_PATH=/embeddings
+EMBEDDING_API_KEY=...
+EMBEDDING_QUERY_MODEL=text-embedding-3-small
+EMBEDDING_MODEL_VERSION=text-embedding-3-small
+EMBEDDING_MAX_BATCH_SIZE=32
+EMBEDDING_CONNECT_TIMEOUT_SECONDS=10
+EMBEDDING_TIMEOUT_SECONDS=30
+```
+
+`OPENAI_API_KEY` is accepted as the API-key fallback. The returned vector size is validated against
+`ARTIFACT_VECTOR_DIMENSIONS` before vectors reach the store.
 
 Optional safe response controls are `ARTIFACT_MCP_MAX_TEXT_CHARACTERS`,
 `ARTIFACT_MCP_MAX_CONTENT_BYTES`, and `ARTIFACT_MCP_REQUEST_TIMEOUT_SECONDS`. The deployment provider

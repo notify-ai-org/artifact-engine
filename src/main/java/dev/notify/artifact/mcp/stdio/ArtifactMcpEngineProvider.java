@@ -1,6 +1,7 @@
 package dev.notify.artifact.mcp.stdio;
 
 import dev.notify.artifact.ArtifactEngine;
+import dev.notify.artifact.environment.Environment;
 
 /**
  * Service-provider hook used by the generic stdio launcher.
@@ -10,7 +11,7 @@ import dev.notify.artifact.ArtifactEngine;
  * credentials or bypasses the application's normal authorization policy.
  */
 public interface ArtifactMcpEngineProvider extends AutoCloseable {
-  ArtifactEngine createEngine();
+  ArtifactEngine createEngine(Environment environment);
 
   @Override
   default void close() {}

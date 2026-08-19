@@ -1,13 +1,18 @@
 package dev.notify.artifact.mcp.stdio;
 
 import dev.notify.artifact.ArtifactEngine;
+import dev.notify.artifact.environment.CommandLineEnvironmentSource;
+import dev.notify.artifact.environment.Environment;
+import dev.notify.artifact.environment.PropertiesFileEnvironmentSource;
+import dev.notify.artifact.environment.StandardEnvironment;
+import dev.notify.artifact.environment.SystemEnvironmentSource;
 import dev.notify.artifact.mcp.McpArtifactGateway;
+import java.io.IOException;
 import java.io.InputStream;
 import java.io.PrintStream;
 import java.time.Duration;
 import java.util.Arrays;
 import java.util.LinkedHashSet;
-import java.util.ServiceLoader;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 
@@ -19,6 +24,7 @@ public final class ArtifactMcpStdioMain {
   public static final String MAX_TEXT_ENV = "ARTIFACT_MCP_MAX_TEXT_CHARACTERS";
   public static final String MAX_CONTENT_ENV = "ARTIFACT_MCP_MAX_CONTENT_BYTES";
   public static final String TIMEOUT_ENV = "ARTIFACT_MCP_REQUEST_TIMEOUT_SECONDS";
+  private static final String PROPERTIES_RESOURCE = "/artifact-mcp.properties";
 
   private static final int DEFAULT_MAX_TEXT_CHARACTERS = 32_768;
   private static final int DEFAULT_MAX_CONTENT_BYTES = 256 * 1_024;
@@ -32,23 +38,24 @@ public final class ArtifactMcpStdioMain {
     // Reserve the original stdout stream for JSON-RPC before any provider can emit a log line.
     System.setOut(System.err);
 
-    ArtifactMcpEngineProvider provider = loadProvider();
-    ArtifactEngine engine = provider.createEngine();
+    Environment environment = environment(args);
+    ArtifactMcpEngineProvider provider = new DefaultArtifactMcpEngineProvider();
+    ArtifactEngine engine = provider.createEngine(environment);
     McpArtifactGateway gateway =
         new McpArtifactGateway(
             engine,
-            positiveInt(MAX_TEXT_ENV, DEFAULT_MAX_TEXT_CHARACTERS),
-            positiveInt(MAX_CONTENT_ENV, DEFAULT_MAX_CONTENT_BYTES));
+            positiveInt(environment, MAX_TEXT_ENV, DEFAULT_MAX_TEXT_CHARACTERS),
+            positiveInt(environment, MAX_CONTENT_ENV, DEFAULT_MAX_CONTENT_BYTES));
     McpArtifactGateway.Session session =
         new McpArtifactGateway.Session(
-            requiredEnvironment(PRINCIPAL_ENV),
-            requiredEnvironment(TENANT_ENV),
-            scopes(requiredEnvironment(SCOPES_ENV)));
+            requiredEnvironment(environment, PRINCIPAL_ENV),
+            requiredEnvironment(environment, TENANT_ENV),
+            scopes(requiredEnvironment(environment, SCOPES_ENV)));
     ArtifactMcpStdioServer server =
         new ArtifactMcpStdioServer(
             gateway,
             session,
-            Duration.ofSeconds(positiveInt(TIMEOUT_ENV, DEFAULT_TIMEOUT_SECONDS)),
+            Duration.ofSeconds(positiveInt(environment, TIMEOUT_ENV, DEFAULT_TIMEOUT_SECONDS)),
             protocolInput,
             protocolOutput);
 
@@ -66,25 +73,31 @@ public final class ArtifactMcpStdioMain {
     new CountDownLatch(1).await();
   }
 
-  private static ArtifactMcpEngineProvider loadProvider() {
-    var providers = ServiceLoader.load(ArtifactMcpEngineProvider.class).stream().toList();
-    if (providers.size() != 1) {
-      throw new IllegalStateException(
-          "Exactly one ArtifactMcpEngineProvider must be registered; found " + providers.size());
+  static Environment environment(String[] args) {
+    InputStream properties = ArtifactMcpStdioMain.class.getResourceAsStream(PROPERTIES_RESOURCE);
+    if (properties == null) {
+      throw new IllegalStateException("Missing classpath resource " + PROPERTIES_RESOURCE);
     }
-    return providers.get(0).get();
+    try (properties) {
+      return new StandardEnvironment(
+          new CommandLineEnvironmentSource(args),
+          new SystemEnvironmentSource(),
+          new PropertiesFileEnvironmentSource(PROPERTIES_RESOURCE, properties));
+    } catch (IOException exception) {
+      throw new IllegalStateException("Unable to load " + PROPERTIES_RESOURCE, exception);
+    }
   }
 
-  private static String requiredEnvironment(String name) {
-    String value = System.getenv(name);
+  private static String requiredEnvironment(Environment environment, String name) {
+    String value = environment.getProperty(name);
     if (value == null || value.isBlank()) {
       throw new IllegalStateException(name + " is required");
     }
     return value.trim();
   }
 
-  private static int positiveInt(String name, int fallback) {
-    String raw = System.getenv(name);
+  private static int positiveInt(Environment environment, String name, int fallback) {
+    String raw = environment.getProperty(name);
     if (raw == null || raw.isBlank()) {
       return fallback;
     }
