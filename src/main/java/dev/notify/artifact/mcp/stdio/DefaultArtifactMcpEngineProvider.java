@@ -6,16 +6,18 @@ import com.zaxxer.hikari.HikariDataSource;
 import dev.notify.artifact.ArtifactEngine;
 import dev.notify.artifact.DefaultArtifactEngine;
 import dev.notify.artifact.EngineOptions;
-import dev.notify.artifact.auth.AuthorizationService;
 import dev.notify.artifact.auth.DataVerifier;
+import dev.notify.artifact.auth.DefaultAuthorizationService;
 import dev.notify.artifact.dispatcher.JobDispatcher;
+import dev.notify.artifact.dispatcher.QueuingJobDispatcher;
 import dev.notify.artifact.embed.EmbeddingCache;
 import dev.notify.artifact.embed.EmbeddingService;
 import dev.notify.artifact.embed.InMemoryEmbeddingCache;
 import dev.notify.artifact.embed.OkHttpEmbeddingProvider;
 import dev.notify.artifact.environment.Environment;
 import dev.notify.artifact.factory.DefaultArtifactJobFactory;
-import dev.notify.artifact.job.Job;
+import dev.notify.artifact.queue.InMemoryJobQueue;
+import dev.notify.artifact.queue.QueueManager;
 import dev.notify.artifact.jdbc.JdbiMetadataStore;
 import dev.notify.artifact.jdbc.JdbiVectorStore;
 import dev.notify.artifact.spool.DurableSpool;
@@ -102,15 +104,11 @@ public final class DefaultArtifactMcpEngineProvider implements ArtifactMcpEngine
             spool,
             new DataVerifier(),
             embeddingRuntime.service(),
-            readOnlyAuthorization(),
+            new DefaultAuthorizationService(),
             EngineOptions.defaults());
-    JobDispatcher directDispatcher =
-        new JobDispatcher() {
-          @Override
-          public <R> R dispatch(Job<R> job) throws Exception {
-            return job.execute();
-          }
-        };
+    JobDispatcher directDispatcher = new QueuingJobDispatcher(
+      new QueueManager(new InMemoryJobQueue(), metadata, null, null)
+    );
     engine = new DefaultArtifactEngine(jobs, directDispatcher);
     return engine;
   }
@@ -199,17 +197,6 @@ public final class DefaultArtifactMcpEngineProvider implements ArtifactMcpEngine
       if (value != null && !value.isBlank()) return value;
     }
     return null;
-  }
-
-  private static AuthorizationService readOnlyAuthorization() {
-    return (principalId, tenantId, permission) -> {
-      if (permission != AuthorizationService.Permission.SEARCH
-          && permission != AuthorizationService.Permission.READ_METADATA
-          && permission != AuthorizationService.Permission.READ_TEXT
-          && permission != AuthorizationService.Permission.DOWNLOAD) {
-        throw new SecurityException("The default MCP engine is read-only");
-      }
-    };
   }
 
   private static EmbeddingRuntime embeddingService(
