@@ -16,7 +16,7 @@ import java.util.Objects;
  */
 public final class QueuingJobDispatcher implements JobDispatcher {
   private final QueueManager queueManager;
-  
+
   public QueuingJobDispatcher(QueueManager queueManager) {
     this.queueManager = Objects.requireNonNull(queueManager, "queueManager");
   }
@@ -24,6 +24,11 @@ public final class QueuingJobDispatcher implements JobDispatcher {
   @Override
   public <R> R dispatch(Job<R> job) throws Exception {
     Objects.requireNonNull(job, "job");
+    if (!(job instanceof QueueableJob<?>)) {
+      return job.execute();
+    }
+
+    @SuppressWarnings("unchecked")
     QueueableJob<R> queueableJob = (QueueableJob<R>) job;
     JobRecord record = requirePending(queueableJob.queueRecord());
     queueManager.enqueue(record);

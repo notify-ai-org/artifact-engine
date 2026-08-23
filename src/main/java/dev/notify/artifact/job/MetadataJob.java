@@ -6,7 +6,7 @@ import dev.notify.artifact.model.Artifact;
 import dev.notify.artifact.store.MetadataStore;
 
 /** Authorizes and retrieves tenant-scoped artifact metadata. */
-public final class MetadataJob extends AbstractJob<Artifact> {
+public final class MetadataJob extends AbstractJob<Artifact> implements DirectJob<Artifact> {
   private final String principalId;
   private final String tenantId;
   private final String artifactId;

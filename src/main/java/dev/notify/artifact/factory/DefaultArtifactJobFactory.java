@@ -22,6 +22,7 @@ import dev.notify.artifact.store.VectorStore;
 import java.io.InputStream;
 import java.util.List;
 import java.util.Objects;
+import dev.notify.artifact.workflow.WorkflowManager;
 
 /** Default factory that supplies workflow jobs with their required infrastructure collaborators. */
 public final class DefaultArtifactJobFactory implements ArtifactJobFactory {
@@ -32,6 +33,7 @@ public final class DefaultArtifactJobFactory implements ArtifactJobFactory {
   private final EmbeddingService embeddingService;
   private final ArtifactAccessVerifier accessVerifier;
   private final EngineOptions options;
+  private final WorkflowManager workflowManager;
 
   public DefaultArtifactJobFactory(
       MetadataStore metadataStore,
@@ -42,6 +44,20 @@ public final class DefaultArtifactJobFactory implements ArtifactJobFactory {
       EmbeddingService embeddingService,
       AuthorizationService authorizationService,
       EngineOptions options) {
+    this(metadataStore, vectorStore, objectStore, durableSpool, dataVerifier, embeddingService,
+        authorizationService, options, null);
+  }
+
+  public DefaultArtifactJobFactory(
+      MetadataStore metadataStore,
+      VectorStore vectorStore,
+      ObjectStore objectStore,
+      DurableSpool durableSpool,
+      DataVerifier dataVerifier,
+      EmbeddingService embeddingService,
+      AuthorizationService authorizationService,
+      EngineOptions options,
+      WorkflowManager workflowManager) {
     this.metadataStore = Objects.requireNonNull(metadataStore, "metadataStore");
     this.vectorStore = Objects.requireNonNull(vectorStore, "vectorStore");
     this.objectStore = Objects.requireNonNull(objectStore, "objectStore");
@@ -52,6 +68,7 @@ public final class DefaultArtifactJobFactory implements ArtifactJobFactory {
         new ArtifactAccessVerifier(
             Objects.requireNonNull(authorizationService, "authorizationService"), dataVerifier);
     this.options = Objects.requireNonNull(options, "options");
+    this.workflowManager = workflowManager;
   }
 
   @Override
@@ -61,7 +78,8 @@ public final class DefaultArtifactJobFactory implements ArtifactJobFactory {
         metadataStore,
         durableSpool,
         accessVerifier,
-        options);
+        options,
+        workflowManager);
   }
 
   @Override

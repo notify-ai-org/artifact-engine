@@ -11,6 +11,7 @@ import dev.notify.artifact.auth.DefaultAuthorizationService;
 import dev.notify.artifact.dispatcher.JobDispatcher;
 import dev.notify.artifact.dispatcher.QueuingJobDispatcher;
 import dev.notify.artifact.embed.EmbeddingCache;
+import dev.notify.artifact.embed.EmbeddingProvider;
 import dev.notify.artifact.embed.EmbeddingService;
 import dev.notify.artifact.embed.InMemoryEmbeddingCache;
 import dev.notify.artifact.embed.OkHttpEmbeddingProvider;
@@ -18,6 +19,7 @@ import dev.notify.artifact.environment.Environment;
 import dev.notify.artifact.factory.DefaultArtifactJobFactory;
 import dev.notify.artifact.queue.InMemoryJobQueue;
 import dev.notify.artifact.queue.QueueManager;
+import dev.notify.artifact.retry.RetryPolicy;
 import dev.notify.artifact.jdbc.JdbiMetadataStore;
 import dev.notify.artifact.jdbc.JdbiVectorStore;
 import dev.notify.artifact.spool.DurableSpool;
@@ -28,6 +30,10 @@ import dev.notify.artifact.store.S3ObjectStore;
 import dev.notify.artifact.store.VectorStore;
 import java.io.IOException;
 import java.nio.file.Path;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.concurrent.TimeUnit;
 import okhttp3.HttpUrl;
 import okhttp3.OkHttpClient;
@@ -47,7 +53,9 @@ public final class DefaultArtifactMcpEngineProvider implements ArtifactMcpEngine
   private ArtifactEngine engine;
   private HikariDataSource dataSource;
   private OkHttpClient embeddingHttpClient;
+  private EmbeddingService embeddingService;
   private S3Client s3Client;
+  private dev.notify.artifact.worker.DirectJobWorker directJobWorker;
 
   @Override
   public synchronized ArtifactEngine createEngine(Environment environment) {
@@ -81,6 +89,7 @@ public final class DefaultArtifactMcpEngineProvider implements ArtifactMcpEngine
             property(environment, "ARTIFACT_S3_EXPECTED_BUCKET_OWNER"),
             booleanProperty(environment, "ARTIFACT_S3_BUCKET_KEY_ENABLED", true)));
     EmbeddingRuntime embeddingRuntime = embeddingService(environment, objectMapper, vectorDimensions);
+    embeddingService = embeddingRuntime.service();
     embeddingHttpClient = embeddingRuntime.client();
     DurableSpool spool;
     try {
@@ -106,15 +115,18 @@ public final class DefaultArtifactMcpEngineProvider implements ArtifactMcpEngine
             embeddingRuntime.service(),
             new DefaultAuthorizationService(),
             EngineOptions.defaults());
-    JobDispatcher directDispatcher = new QueuingJobDispatcher(
-      new QueueManager(new InMemoryJobQueue(), metadata, null, null)
-    );
+    directJobWorker = new dev.notify.artifact.worker.DirectJobWorker(4, 256);
+    JobDispatcher directDispatcher =
+        new dev.notify.artifact.dispatcher.DirectJobDispatcher(directJobWorker);
     engine = new DefaultArtifactEngine(jobs, directDispatcher);
     return engine;
   }
 
   @Override
   public void close() {
+    if (embeddingService != null) {
+      embeddingService.close();
+    }
     if (dataSource != null) {
       dataSource.close();
     }
@@ -124,6 +136,9 @@ public final class DefaultArtifactMcpEngineProvider implements ArtifactMcpEngine
     }
     if (s3Client != null) {
       s3Client.close();
+    }
+    if (directJobWorker != null) {
+      directJobWorker.close();
     }
   }
 
@@ -201,7 +216,11 @@ public final class DefaultArtifactMcpEngineProvider implements ArtifactMcpEngine
 
   private static EmbeddingRuntime embeddingService(
       Environment environment, ObjectMapper objectMapper, int dimensions) {
-    EmbeddingCache cache = new InMemoryEmbeddingCache(dimensions);
+    Duration cacheTtl =
+        Duration.ofSeconds(positiveLong(environment, "EMBEDDING_CACHE_TTL_SECONDS", 3600));
+    EmbeddingCache cache =
+        new InMemoryEmbeddingCache(
+            positiveInt(environment, "EMBEDDING_CACHE_MAX_ENTRIES", 10_000), cacheTtl);
     String baseUrl =
         firstNonBlank(property(environment, "EMBEDDING_BASE_URL"), "https://api.openai.com/v1");
     String apiKey =
@@ -218,23 +237,36 @@ public final class DefaultArtifactMcpEngineProvider implements ArtifactMcpEngine
             .writeTimeout(timeoutSeconds, TimeUnit.SECONDS)
             .callTimeout(timeoutSeconds, TimeUnit.SECONDS)
             .build();
-    String model =
+    String queryModel =
         firstNonBlank(
             property(environment, "EMBEDDING_QUERY_MODEL"),
             firstModel(property(environment, "EMBEDDING_MODELS")),
             "text-embedding-3-small");
-    OkHttpEmbeddingProvider provider =
-        new OkHttpEmbeddingProvider(
-            client,
-            objectMapper,
-            embeddingEndpoint(baseUrl, path),
-            apiKey,
-            model,
-            firstNonBlank(property(environment, "EMBEDDING_MODEL_VERSION"), model),
-            dimensions);
+    LinkedHashSet<String> modelNames = new LinkedHashSet<>();
+    modelNames.add(queryModel);
+    modelNames.addAll(models(property(environment, "EMBEDDING_MODELS")));
+    List<EmbeddingProvider> providers = new ArrayList<>();
+    for (String model : modelNames) {
+      providers.add(
+          new OkHttpEmbeddingProvider(
+              client,
+              objectMapper,
+              embeddingEndpoint(baseUrl, path),
+              apiKey,
+              model,
+              model.equals(queryModel)
+                  ? firstNonBlank(property(environment, "EMBEDDING_MODEL_VERSION"), model)
+                  : model,
+              dimensions));
+    }
     return new EmbeddingRuntime(
         new EmbeddingService(
-            provider, cache, positiveInt(environment, "EMBEDDING_MAX_BATCH_SIZE", 32)),
+            providers,
+            cache,
+            positiveInt(environment, "EMBEDDING_MAX_BATCH_SIZE", 32),
+            Duration.ofMillis(positiveLong(environment, "EMBEDDING_MAX_WAIT_MILLIS", 25)),
+            cacheTtl,
+            RetryPolicy.defaults()),
         client);
   }
 
@@ -251,6 +283,15 @@ public final class DefaultArtifactMcpEngineProvider implements ArtifactMcpEngine
       if (!model.isBlank()) return model.trim();
     }
     return null;
+  }
+
+  private static List<String> models(String configured) {
+    if (configured == null) return List.of();
+    List<String> models = new ArrayList<>();
+    for (String model : configured.split(",")) {
+      if (!model.isBlank()) models.add(model.trim());
+    }
+    return models;
   }
 
   private record EmbeddingRuntime(EmbeddingService service, OkHttpClient client) {}

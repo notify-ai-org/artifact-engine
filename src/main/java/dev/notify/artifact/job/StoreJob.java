@@ -9,9 +9,12 @@ import dev.notify.artifact.util.StorageKeyFactory;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.NoSuchElementException;
+import dev.notify.artifact.model.JobRecord;
+import dev.notify.artifact.util.Checksum;
+import java.util.Map;
 
 /** Uploads a spooled original with a stable key and verifies it before marking it stored. */
-public final class StoreJob extends AbstractJob<Artifact> {
+public final class StoreJob extends AbstractJob<Artifact> implements QueueableJob<Artifact> {
   private final String tenantId;
   private final String artifactId;
   private final ObjectStore objectStore;
@@ -75,6 +78,20 @@ public final class StoreJob extends AbstractJob<Artifact> {
         tenantId,
         artifactId,
         current -> current.withStorage(ArtifactStatus.Storage.STORED, storageKey));
+  }
+
+  @Override
+  public JobRecord queueRecord() {
+    Artifact artifact = required(tenantId, artifactId);
+    return JobRecord.pending(
+        Checksum.sha256(tenantId + ":" + artifactId + ":" + artifact.version() + ":STORE"),
+        tenantId, artifactId, JobRecord.JobType.STORE,
+        Map.of("version", Long.toString(artifact.version())));
+  }
+
+  @Override
+  public Artifact queuedResult() {
+    return required(tenantId, artifactId);
   }
 
   private static String safeMessage(Exception failure) {

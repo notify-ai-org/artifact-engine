@@ -11,7 +11,7 @@ import java.io.IOException;
 import java.io.InputStream;
 
 /** Authorizes and opens an original artifact from object storage or the durable spool. */
-public final class FetchJob extends AbstractJob<InputStream> {
+public final class FetchJob extends AbstractJob<InputStream> implements DirectJob<InputStream> {
   private final String principalId;
   private final String tenantId;
   private final String artifactId;

@@ -8,7 +8,7 @@ import dev.notify.artifact.store.MetadataStore;
 import dev.notify.artifact.store.VectorStore;
 
 /** Retrieves bounded extracted text and applies the retrieval content-security chain. */
-public final class ExtractedTextJob extends AbstractJob<String> {
+public final class ExtractedTextJob extends AbstractJob<String> implements DirectJob<String> {
   private final String principalId;
   private final String tenantId;
   private final String artifactId;

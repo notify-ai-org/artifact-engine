@@ -24,7 +24,8 @@ public record RetryPolicy(
   public Duration delay(int completedAttempts) {
     double base =
         initialDelay.toMillis() * Math.pow(multiplier, Math.max(0, completedAttempts - 1));
-    double randomized = base * (1 + ThreadLocalRandom.current().nextDouble(-jitter, jitter));
+    double randomized =
+        jitter == 0 ? base : base * (1 + ThreadLocalRandom.current().nextDouble(-jitter, jitter));
     return Duration.ofMillis(Math.min(maxDelay.toMillis(), Math.max(0, (long) randomized)));
   }
 

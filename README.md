@@ -216,14 +216,22 @@ EMBEDDING_BASE_URL=https://api.openai.com/v1
 EMBEDDING_API_PATH=/embeddings
 EMBEDDING_API_KEY=...
 EMBEDDING_QUERY_MODEL=text-embedding-3-small
+EMBEDDING_MODELS=text-embedding-3-small,text-embedding-3-large
 EMBEDDING_MODEL_VERSION=text-embedding-3-small
 EMBEDDING_MAX_BATCH_SIZE=32
+EMBEDDING_MAX_WAIT_MILLIS=25
+EMBEDDING_CACHE_MAX_ENTRIES=10000
+EMBEDDING_CACHE_TTL_SECONDS=3600
 EMBEDDING_CONNECT_TIMEOUT_SECONDS=10
 EMBEDDING_TIMEOUT_SECONDS=30
 ```
 
 `OPENAI_API_KEY` is accepted as the API-key fallback. The returned vector size is validated against
 `ARTIFACT_VECTOR_DIMENSIONS` before vectors reach the store.
+`EMBEDDING_QUERY_MODEL` is the default model; additional comma-separated `EMBEDDING_MODELS` can be
+selected through `EmbeddingService.embed(model, texts)`. Concurrent misses for the same model are
+coalesced until the batch is full or `EMBEDDING_MAX_WAIT_MILLIS` elapses. Provider failures use the
+artifact retry policy, and successful vectors expire from the local cache after the configured TTL.
 
 Optional safe response controls are `ARTIFACT_MCP_MAX_TEXT_CHARACTERS`,
 `ARTIFACT_MCP_MAX_CONTENT_BYTES`, and `ARTIFACT_MCP_REQUEST_TIMEOUT_SECONDS`. The deployment provider

@@ -11,7 +11,7 @@ import dev.notify.artifact.store.VectorStore;
 import java.io.IOException;
 
 /** Tombstones metadata before idempotently deleting derived and original artifact data. */
-public final class DeleteJob extends AbstractJob<Void> {
+public final class DeleteJob extends AbstractJob<Void> implements DirectJob<Void> {
   private final String principalId;
   private final String tenantId;
   private final String artifactId;

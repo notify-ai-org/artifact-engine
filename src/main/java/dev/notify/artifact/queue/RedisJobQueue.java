@@ -3,12 +3,12 @@ package dev.notify.artifact.queue;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.notify.artifact.model.JobRecord;
+import io.lettuce.core.ScriptOutputType;
+import io.lettuce.core.api.StatefulRedisConnection;
+import io.lettuce.core.api.sync.RedisCommands;
 import java.time.Duration;
 import java.time.Instant;
-import java.util.List;
 import java.util.Optional;
-import org.springframework.data.redis.core.StringRedisTemplate;
-import org.springframework.data.redis.core.script.DefaultRedisScript;
 
 /**
  * Redis sorted-set queue whose claim and owner-token completion transitions are atomic Lua scripts.
@@ -17,19 +17,15 @@ import org.springframework.data.redis.core.script.DefaultRedisScript;
 public final class RedisJobQueue implements JobQueue {
   private static final int RECOVERY_BATCH_SIZE = 100;
 
-  private static final DefaultRedisScript<Long> ENQUEUE =
-      script(
-          Long.class,
+  private static final String ENQUEUE =
           """
           if redis.call('EXISTS', KEYS[1]) == 1 then return 0 end
           redis.call('SET', KEYS[1], ARGV[1])
           redis.call('ZADD', KEYS[2], ARGV[2], ARGV[3])
           return 1
-          """);
+          """;
 
-  private static final DefaultRedisScript<String> CLAIM =
-      script(
-          String.class,
+  private static final String CLAIM =
           """
           local ids = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, 1)
           if #ids == 0 then return nil end
@@ -51,11 +47,9 @@ public final class RedisJobQueue implements JobQueue {
           redis.call('ZREM', KEYS[1], id)
           redis.call('ZADD', KEYS[2], ARGV[6], id)
           return updated
-          """);
+          """;
 
-  private static final DefaultRedisScript<Long> FINISH =
-      script(
-          Long.class,
+  private static final String FINISH =
           """
           local json = redis.call('GET', KEYS[1])
           if not json then return 0 end
@@ -75,11 +69,9 @@ public final class RedisJobQueue implements JobQueue {
             redis.call('ZADD', KEYS[3], ARGV[6], job.id)
           end
           return 1
-          """);
+          """;
 
-  private static final DefaultRedisScript<Long> RENEW =
-      script(
-          Long.class,
+  private static final String RENEW =
           """
           local json = redis.call('GET', KEYS[1])
           if not json then return 0 end
@@ -92,11 +84,9 @@ public final class RedisJobQueue implements JobQueue {
           redis.call('SET', KEYS[1], cjson.encode(job))
           redis.call('ZADD', KEYS[2], ARGV[5], job.id)
           return 1
-          """);
+          """;
 
-  private static final DefaultRedisScript<Long> RECOVER =
-      script(
-          Long.class,
+  private static final String RECOVER =
           """
           local ids = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, ARGV[2])
           local recovered = 0
@@ -118,13 +108,19 @@ public final class RedisJobQueue implements JobQueue {
             redis.call('ZREM', KEYS[1], id)
           end
           return recovered
-          """);
+          """;
 
-  private final StringRedisTemplate redis;
+  private final RedisCommands<String, String> redis;
   private final ObjectMapper json;
   private final String namespace;
 
-  public RedisJobQueue(StringRedisTemplate redis, ObjectMapper json, String namespace) {
+  public RedisJobQueue(
+      StatefulRedisConnection<String, String> connection, ObjectMapper json, String namespace) {
+    this(connection.sync(), json, namespace);
+  }
+
+  public RedisJobQueue(
+      RedisCommands<String, String> redis, ObjectMapper json, String namespace) {
     this.redis = redis;
     this.json = json.copy().findAndRegisterModules();
     if (namespace == null || !namespace.matches("[A-Za-z0-9:_-]+")) {
@@ -135,9 +131,10 @@ public final class RedisJobQueue implements JobQueue {
 
   @Override
   public void enqueue(JobRecord job) {
-    redis.execute(
+    redis.eval(
         ENQUEUE,
-        List.of(jobKey(job.id()), readyKey(job.type())),
+        ScriptOutputType.INTEGER,
+        new String[] {jobKey(job.id()), readyKey(job.type())},
         serialize(job),
         Long.toString(score(job.nextAttemptAt())),
         job.id());
@@ -148,9 +145,10 @@ public final class RedisJobQueue implements JobQueue {
       JobRecord.JobType type, String owner, Duration lease, Instant now) {
     Instant expiry = now.plus(lease);
     String claimed =
-        redis.execute(
+        redis.eval(
             CLAIM,
-            List.of(readyKey(type), leasedKey()),
+            ScriptOutputType.VALUE,
+            new String[] {readyKey(type), leasedKey()},
             Long.toString(now.toEpochMilli()),
             owner,
             expiry.toString(),
@@ -169,9 +167,10 @@ public final class RedisJobQueue implements JobQueue {
   public boolean renew(String jobId, String owner, Duration lease, Instant now) {
     Instant expiry = now.plus(lease);
     Long renewed =
-        redis.execute(
+        redis.eval(
             RENEW,
-            List.of(jobKey(jobId), leasedKey()),
+            ScriptOutputType.INTEGER,
+            new String[] {jobKey(jobId), leasedKey()},
             owner,
             Long.toString(now.toEpochMilli()),
             expiry.toString(),
@@ -193,9 +192,10 @@ public final class RedisJobQueue implements JobQueue {
   @Override
   public int recoverExpired(Instant now) {
     Long recovered =
-        redis.execute(
+        redis.eval(
             RECOVER,
-            List.of(leasedKey()),
+            ScriptOutputType.INTEGER,
+            new String[] {leasedKey()},
             Long.toString(now.toEpochMilli()),
             Integer.toString(RECOVERY_BATCH_SIZE),
             jobPrefix(),
@@ -212,9 +212,10 @@ public final class RedisJobQueue implements JobQueue {
     }
     Instant now = Instant.now();
     Long updated =
-        redis.execute(
+        redis.eval(
             FINISH,
-            List.of(jobKey(jobId), leasedKey(), readyKey(existing.type())),
+            ScriptOutputType.INTEGER,
+            new String[] {jobKey(jobId), leasedKey(), readyKey(existing.type())},
             owner,
             status.name(),
             error == null ? "" : error,
@@ -226,7 +227,7 @@ public final class RedisJobQueue implements JobQueue {
   }
 
   private JobRecord load(String jobId) {
-    String value = redis.opsForValue().get(jobKey(jobId));
+    String value = redis.get(jobKey(jobId));
     return value == null ? null : deserialize(value);
   }
 
@@ -268,12 +269,5 @@ public final class RedisJobQueue implements JobQueue {
 
   private String leasedKey() {
     return namespace + "leased";
-  }
-
-  private static <T> DefaultRedisScript<T> script(Class<T> resultType, String source) {
-    DefaultRedisScript<T> script = new DefaultRedisScript<>();
-    script.setResultType(resultType);
-    script.setScriptText(source);
-    return script;
   }
 }

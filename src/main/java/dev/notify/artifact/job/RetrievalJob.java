@@ -20,7 +20,8 @@ import java.util.Objects;
 import java.util.Set;
 
 /** Authorized hybrid retrieval workflow with reciprocal-rank fusion and content sanitization. */
-public final class RetrievalJob extends AbstractJob<List<Requests.SearchHit>> {
+public final class RetrievalJob extends AbstractJob<List<Requests.SearchHit>>
+    implements DirectJob<List<Requests.SearchHit>> {
   private final Requests.Search request;
   private final VectorStore vectorStore;
   private final EmbeddingService embeddingService;

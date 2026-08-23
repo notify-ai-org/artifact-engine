@@ -8,7 +8,8 @@ import dev.notify.artifact.store.MetadataStore;
 import java.util.List;
 
 /** Authorizes and lists live artifact metadata through the tenant-scoped repository boundary. */
-public final class ListMetadataJob extends AbstractJob<List<Artifact>> {
+public final class ListMetadataJob extends AbstractJob<List<Artifact>>
+    implements DirectJob<List<Artifact>> {
   private static final int MAX_LIMIT = 10_000;
   private final String principalId;
   private final String tenantId;

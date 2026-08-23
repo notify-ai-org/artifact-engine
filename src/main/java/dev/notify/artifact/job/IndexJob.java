@@ -20,7 +20,7 @@ import java.util.Map;
 import java.util.NoSuchElementException;
 
 /** Restart-safe indexing pipeline with deterministic chunk/vector identities. */
-public final class IndexJob extends AbstractJob<Integer> {
+public final class IndexJob extends AbstractJob<Integer> implements QueueableJob<Integer> {
   private final String tenantId;
   private final String artifactId;
   private final ObjectStore objectStore;
@@ -105,6 +105,20 @@ public final class IndexJob extends AbstractJob<Integer> {
                   safeMessage(failure)));
       throw failure;
     }
+  }
+
+  @Override
+  public dev.notify.artifact.model.JobRecord queueRecord() {
+    Artifact artifact = requiredArtifact();
+    return dev.notify.artifact.model.JobRecord.pending(
+        Checksum.sha256(tenantId + ":" + artifactId + ":" + artifact.version() + ":INDEX"),
+        tenantId, artifactId, dev.notify.artifact.model.JobRecord.JobType.INDEX,
+        Map.of("version", Long.toString(artifact.version())));
+  }
+
+  @Override
+  public Integer queuedResult() {
+    return 0;
   }
 
   private String extract(Artifact artifact) throws IOException {

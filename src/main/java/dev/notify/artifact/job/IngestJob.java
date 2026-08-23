@@ -15,15 +15,17 @@ import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import dev.notify.artifact.workflow.WorkflowManager;
 
 /**
  * Durable intake workflow: authorize, spool, verify, register metadata, and publish outbox jobs.
  */
-public final class IngestJob extends AbstractJob<Artifact> {
+public final class IngestJob extends AbstractJob<Artifact> implements DirectJob<Artifact> {
   private final Requests.Ingest request;
   private final DurableSpool durableSpool;
   private final ArtifactAccessVerifier accessVerifier;
   private final EngineOptions options;
+  private final WorkflowManager workflowManager;
 
   public IngestJob(
       Requests.Ingest request,
@@ -31,11 +33,22 @@ public final class IngestJob extends AbstractJob<Artifact> {
       DurableSpool durableSpool,
       ArtifactAccessVerifier accessVerifier,
       EngineOptions options) {
+    this(request, metadataStore, durableSpool, accessVerifier, options, null);
+  }
+
+  public IngestJob(
+      Requests.Ingest request,
+      MetadataStore metadataStore,
+      DurableSpool durableSpool,
+      ArtifactAccessVerifier accessVerifier,
+      EngineOptions options,
+      WorkflowManager workflowManager) {
     super(accessVerifier, metadataStore);
     this.request = request;
     this.durableSpool = durableSpool;
     this.accessVerifier = accessVerifier;
     this.options = options;
+    this.workflowManager = workflowManager;
   }
 
   @Override
@@ -103,9 +116,17 @@ public final class IngestJob extends AbstractJob<Artifact> {
             now,
             now);
     try {
+      List<JobRecord> operations = initialOperations(artifact);
       MetadataStore.Registration registration =
           metadataStore.register(
-              artifact, initialOperations(artifact), options.deduplicateContent());
+              artifact, workflowManager == null ? operations : List.of(), options.deduplicateContent());
+      if (registration.outcome() == MetadataStore.Registration.Outcome.CREATED
+          && workflowManager != null) {
+        workflowManager.create(
+            "ingest-store-index",
+            operations,
+            Map.of("tenantId", artifact.tenantId(), "artifactId", artifact.id()));
+      }
       if (registration.outcome() != MetadataStore.Registration.Outcome.CREATED) {
         durableSpool.discard(spoolEntry.contentPath());
       }

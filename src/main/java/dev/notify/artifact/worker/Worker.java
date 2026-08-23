@@ -4,6 +4,7 @@ import dev.notify.artifact.job.Job;
 import dev.notify.artifact.model.JobRecord;
 import dev.notify.artifact.queue.JobQueue;
 import dev.notify.artifact.retry.RetryPolicy;
+import dev.notify.artifact.workflow.JobUpdateListener;
 
 import java.time.Duration;
 import java.time.Instant;
@@ -32,6 +33,8 @@ public final class Worker implements AutoCloseable {
   private final Duration leaseDuration;
   private final Duration idlePollInterval;
   private final Consumer<JobFailure> failureHandler;
+  private final JobRecordExecutor jobExecutor;
+  private final JobUpdateListener jobUpdateListener;
   private final AtomicBoolean running = new AtomicBoolean();
   private final ScheduledExecutorService heartbeat;
   private final java.util.Map<String, StateMachine<JobStateMachines.State>> stateMachines =
@@ -50,15 +53,37 @@ public final class Worker implements AutoCloseable {
       Duration idlePollInterval,
       Duration flushInterval,
       Consumer<JobFailure> failureHandler) {
+    this(
+        id, queueCapacity, batchSize, batchBytes, type, queue, retryPolicy, leaseDuration,
+        idlePollInterval, flushInterval, failureHandler,
+        ignored -> {}, (jobId, status, failure) -> {});
+  }
+
+  public Worker(
+      String id,
+      int queueCapacity,
+      int batchSize,
+      long batchBytes,
+      JobRecord.JobType type,
+      JobQueue queue,
+      RetryPolicy retryPolicy,
+      Duration leaseDuration,
+      Duration idlePollInterval,
+      Duration flushInterval,
+      Consumer<JobFailure> failureHandler,
+      JobRecordExecutor jobExecutor,
+      JobUpdateListener jobUpdateListener) {
     this.id = id;
     this.queueCapacity = queueCapacity;
     this.buffer = new Buffer<>(batchSize, batchBytes, flushInterval);
-    this.type = Objects.requireNonNull(type, "type");
-    this.queue = Objects.requireNonNull(queue, "queue");
-    this.retryPolicy = Objects.requireNonNull(retryPolicy, "retryPolicy");
+    this.type = type;
+    this.queue = queue;
+    this.retryPolicy = retryPolicy;
     this.leaseDuration = Objects.requireNonNull(leaseDuration, "leaseDuration");
     this.idlePollInterval = Objects.requireNonNull(idlePollInterval, "idlePollInterval");
     this.failureHandler = Objects.requireNonNull(failureHandler, "failureHandler");
+    this.jobExecutor = Objects.requireNonNull(jobExecutor, "jobExecutor");
+    this.jobUpdateListener = Objects.requireNonNull(jobUpdateListener, "jobUpdateListener");
     if (leaseDuration.isZero() || leaseDuration.isNegative()) {
       throw new IllegalArgumentException("leaseDuration must be positive");
     }
@@ -83,6 +108,10 @@ public final class Worker implements AutoCloseable {
   }
 
   private void run() {
+    if (queue == null) {
+      runProcessLocalWorker();
+      return;
+    }
     while (running.get()) {
       try {
         var claimed = queue.claim(type, owner, leaseDuration, Instant.now());
@@ -104,6 +133,17 @@ public final class Worker implements AutoCloseable {
       }
     }
     execute(buffer.drain());
+  }
+
+  private void runProcessLocalWorker() {
+    while (running.get()) {
+      try {
+        Thread.sleep(idlePollInterval.toMillis());
+      } catch (InterruptedException interrupted) {
+        if (running.get()) Thread.currentThread().interrupt();
+        return;
+      }
+    }
   }
 
   private void addToBuffer(Job<?> job) {
@@ -137,22 +177,29 @@ public final class Worker implements AutoCloseable {
       stateMachine.transition(JobStateMachines.State.VALIDATING, "job claimed");
       stateMachine.transition(JobStateMachines.State.BUFFERED, "job validated");
       stateMachine.transition(JobStateMachines.State.RUNNING, "job execution started");
+      jobUpdateListener.onUpdate(job.id(), JobUpdateListener.JobUpdate.RUNNING, null);
+      jobExecutor.execute(job);
       if (!queue.complete(job.id(), owner)) {
         failureHandler.accept(
             new JobFailure(
                 null, new IllegalStateException("Completion rejected for job " + job.id())));
       } else {
         stateMachine.transition(JobStateMachines.State.COMPLETED, "job completed");
+        jobUpdateListener.onUpdate(job.id(), JobUpdateListener.JobUpdate.COMPLETED, null);
       }
     } catch (Exception failure) {
       failureHandler.accept(new JobFailure(null, failure));
       if (job.attempts() >= retryPolicy.maxAttempts()) {
         queue.deadLetter(job.id(), owner, safeMessage(failure));
         stateMachine.transition(JobStateMachines.State.DEAD_LETTER, safeMessage(failure));
+        jobUpdateListener.onUpdate(
+            job.id(), JobUpdateListener.JobUpdate.DEAD_LETTER, safeMessage(failure));
       } else {
         Instant retryAt = Instant.now().plus(retryPolicy.delay(job.attempts()));
         queue.retry(job.id(), owner, retryAt, safeMessage(failure));
         stateMachine.transition(JobStateMachines.State.RETRY_PENDING, safeMessage(failure));
+        jobUpdateListener.onUpdate(
+            job.id(), JobUpdateListener.JobUpdate.RETRY_PENDING, safeMessage(failure));
       }
     } finally {
       activeJob = null;
