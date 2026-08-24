@@ -10,6 +10,7 @@ import dev.notify.artifact.auth.DataVerifier;
 import dev.notify.artifact.auth.DefaultAuthorizationService;
 import dev.notify.artifact.dispatcher.JobDispatcher;
 import dev.notify.artifact.dispatcher.QueuingJobDispatcher;
+import dev.notify.artifact.dispatcher.RoutingJobDispatcher;
 import dev.notify.artifact.embed.EmbeddingCache;
 import dev.notify.artifact.embed.EmbeddingProvider;
 import dev.notify.artifact.embed.EmbeddingService;
@@ -17,11 +18,10 @@ import dev.notify.artifact.embed.InMemoryEmbeddingCache;
 import dev.notify.artifact.embed.OkHttpEmbeddingProvider;
 import dev.notify.artifact.environment.Environment;
 import dev.notify.artifact.factory.DefaultArtifactJobFactory;
-import dev.notify.artifact.queue.InMemoryJobQueue;
-import dev.notify.artifact.queue.QueueManager;
 import dev.notify.artifact.retry.RetryPolicy;
 import dev.notify.artifact.jdbc.JdbiMetadataStore;
 import dev.notify.artifact.jdbc.JdbiVectorStore;
+import dev.notify.artifact.queue.QueueManager;
 import dev.notify.artifact.spool.DurableSpool;
 import dev.notify.artifact.store.InMemoryStores;
 import dev.notify.artifact.store.MetadataStore;
@@ -118,7 +118,10 @@ public final class DefaultArtifactMcpEngineProvider implements ArtifactMcpEngine
     directJobWorker = new dev.notify.artifact.worker.DirectJobWorker(4, 256);
     JobDispatcher directDispatcher =
         new dev.notify.artifact.dispatcher.DirectJobDispatcher(directJobWorker);
-    engine = new DefaultArtifactEngine(jobs, directDispatcher);
+    QueueManager queueManager = new QueueManager();
+    QueuingJobDispatcher queuingDispatcher = new QueuingJobDispatcher(queueManager);
+    JobDispatcher dispatcher = new RoutingJobDispatcher(directDispatcher, queuingDispatcher);
+    engine = new DefaultArtifactEngine(jobs, dispatcher);
     return engine;
   }
 

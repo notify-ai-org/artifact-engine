@@ -7,7 +7,6 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import dev.notify.artifact.dispatcher.QueuingJobDispatcher;
 import dev.notify.artifact.model.JobRecord;
-import dev.notify.artifact.queue.InMemoryJobQueue;
 import dev.notify.artifact.queue.QueueManager;
 import java.time.Duration;
 import java.time.Instant;
@@ -18,21 +17,20 @@ import org.junit.jupiter.api.Test;
 class QueuingJobDispatcherTest {
   @Test
   void enqueuesDurableRecordWithoutExecutingProcessLocalJob() throws Exception {
-    InMemoryJobQueue queue = new InMemoryJobQueue();
     AtomicBoolean executed = new AtomicBoolean();
     JobRecord record =
         JobRecord.pending(
             "operation-1", "tenant-a", "artifact-a", JobRecord.JobType.INDEX, Map.of());
     QueueableJob<String> job = queueable(record, "accepted", executed);
 
-    try (QueueManager queueManager = new QueueManager(queue)) {
+    try (QueueManager queueManager = new QueueManager()) {
       QueuingJobDispatcher dispatcher = new QueuingJobDispatcher(queueManager);
 
       assertEquals("accepted", dispatcher.dispatch(job));
       assertFalse(executed.get(), "background workflow must not execute on the dispatch thread");
       assertEquals(
           "operation-1",
-          queue
+          queueManager
               .claim(
                   JobRecord.JobType.INDEX,
                   "worker-1",
@@ -52,7 +50,7 @@ class QueuingJobDispatcherTest {
           return "complete";
         };
 
-    try (QueueManager queueManager = new QueueManager(new InMemoryJobQueue())) {
+    try (QueueManager queueManager = new QueueManager()) {
       QueuingJobDispatcher dispatcher = new QueuingJobDispatcher(queueManager);
 
       assertEquals("complete", dispatcher.dispatch(inlineJob));
@@ -62,20 +60,19 @@ class QueuingJobDispatcherTest {
 
   @Test
   void repeatedDispatchUsesTheStableOperationId() throws Exception {
-    InMemoryJobQueue queue = new InMemoryJobQueue();
     JobRecord record =
         JobRecord.pending(
             "operation-3", "tenant-a", "artifact-a", JobRecord.JobType.STORE, Map.of());
     QueueableJob<String> job = queueable(record, "accepted", new AtomicBoolean());
 
-    try (QueueManager queueManager = new QueueManager(queue)) {
+    try (QueueManager queueManager = new QueueManager()) {
       QueuingJobDispatcher dispatcher = new QueuingJobDispatcher(queueManager);
 
       dispatcher.dispatch(job);
       dispatcher.dispatch(job);
 
       assertTrue(
-          queue
+          queueManager
               .claim(
                   JobRecord.JobType.STORE,
                   "worker-1",
@@ -83,7 +80,7 @@ class QueuingJobDispatcherTest {
                   Instant.now())
               .isPresent());
       assertTrue(
-          queue
+          queueManager
               .claim(
                   JobRecord.JobType.STORE,
                   "worker-2",
@@ -112,7 +109,7 @@ class QueuingJobDispatcherTest {
             now,
             now);
 
-    try (QueueManager queueManager = new QueueManager(new InMemoryJobQueue())) {
+    try (QueueManager queueManager = new QueueManager()) {
       QueuingJobDispatcher dispatcher = new QueuingJobDispatcher(queueManager);
 
       assertThrows(

@@ -6,7 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertSame;
 import dev.notify.artifact.dispatcher.JobDispatcher;
 import dev.notify.artifact.factory.ArtifactJobFactory;
 import dev.notify.artifact.job.DeleteJob;
-import dev.notify.artifact.job.ExtractedTextJob;
+import dev.notify.artifact.job.DirectJob;
 import dev.notify.artifact.job.FetchJob;
 import dev.notify.artifact.job.IngestJob;
 import dev.notify.artifact.job.Job;
@@ -76,7 +76,7 @@ class EngineDispatchTest {
             MetadataJob.class,
             ListMetadataJob.class,
             FetchJob.class,
-            ExtractedTextJob.class,
+            RetrievalJob.ExtractedText.class,
             RetrievalJob.class,
             DeleteJob.class)) {
       boolean referencesEngine =
@@ -84,6 +84,11 @@ class EngineDispatchTest {
               .anyMatch(field -> ArtifactEngine.class.isAssignableFrom(field.getType()));
       assertEquals(false, referencesEngine, jobType.getSimpleName());
     }
+  }
+
+  @Test
+  void retrievalRunsAsDirectRequestResponseWork() {
+    assertEquals(true, DirectJob.class.isAssignableFrom(RetrievalJob.class));
   }
 
   private static Artifact artifact() {

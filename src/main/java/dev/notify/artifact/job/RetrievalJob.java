@@ -162,4 +162,53 @@ public final class RetrievalJob extends AbstractJob<List<Requests.SearchHit>>
     }
     return Set.copyOf(tags);
   }
+
+  /** Retrieves bounded extracted text and applies the retrieval content-security chain. */
+  public static final class ExtractedText extends AbstractJob<String>
+      implements DirectJob<String> {
+    private final String principalId;
+    private final String tenantId;
+    private final String artifactId;
+    private final int maxCharacters;
+    private final VectorStore vectorStore;
+
+    public ExtractedText(
+        String principalId,
+        String tenantId,
+        String artifactId,
+        int maxCharacters,
+        MetadataStore metadataStore,
+        VectorStore vectorStore,
+        ArtifactAccessVerifier accessVerifier) {
+      super(accessVerifier, metadataStore);
+      this.principalId = principalId;
+      this.tenantId = tenantId;
+      this.artifactId = artifactId;
+      this.maxCharacters = maxCharacters;
+      this.vectorStore = vectorStore;
+    }
+
+    @Override
+    public String execute() {
+      Artifact artifact = requiredReadable(tenantId, artifactId);
+      int limit = Math.max(0, maxCharacters);
+      StringBuilder text = new StringBuilder(Math.min(limit, 16 * 1024));
+      for (ArtifactChunk chunk : vectorStore.chunks(tenantId, artifactId)) {
+        if (text.length() >= limit) {
+          break;
+        }
+        if (!text.isEmpty()) {
+          text.append('\n');
+        }
+        int remaining = limit - text.length();
+        text.append(chunk.text(), 0, Math.min(remaining, chunk.text().length()));
+      }
+      return verify(
+          principalId,
+          tenantId,
+          AuthorizationService.Permission.READ_TEXT,
+          artifact,
+          text.toString());
+    }
+  }
 }

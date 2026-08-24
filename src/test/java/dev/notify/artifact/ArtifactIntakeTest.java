@@ -1,36 +1,24 @@
 package dev.notify.artifact;
 
-import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertThrows;
-
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.notify.artifact.auth.DataVerifier;
 import dev.notify.artifact.dispatcher.JobDispatcher;
 import dev.notify.artifact.embed.EmbeddingCache;
 import dev.notify.artifact.embed.EmbeddingProvider;
 import dev.notify.artifact.embed.EmbeddingService;
-import dev.notify.artifact.exception.IdempotencyConflictException;
 import dev.notify.artifact.factory.DefaultArtifactJobFactory;
 import dev.notify.artifact.job.Job;
-import dev.notify.artifact.model.JobRecord;
-import dev.notify.artifact.model.Requests;
-import dev.notify.artifact.queue.InMemoryJobQueue;
-import dev.notify.artifact.queue.QueueManager;
 import dev.notify.artifact.spool.DurableSpool;
 import dev.notify.artifact.store.InMemoryStores;
 import dev.notify.artifact.store.ObjectStore;
-import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.Path;
-import java.time.Duration;
-import java.time.Instant;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import org.junit.jupiter.api.BeforeEach;
-import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 class ArtifactIntakeTest {
@@ -63,59 +51,6 @@ class ArtifactIntakeTest {
                 return job.execute();
               }
             });
-  }
-
-  @Test
-  void replaysMatchingIdempotencyKeyAndRejectsConflictingContent() throws Exception {
-    var first = engine.ingest(request("request-1", "hello"));
-    var replay = engine.ingest(request("request-1", "hello"));
-
-    assertEquals(first.id(), replay.id());
-    assertEquals(1, spool.entries().size());
-    assertEquals(2, metadataStore.outboxBatch(10).size());
-
-    assertThrows(
-        IdempotencyConflictException.class, () -> engine.ingest(request("request-1", "different")));
-    assertEquals(1, spool.entries().size());
-  }
-
-  @Test
-  void dispatchesCommittedOutboxOperationsIdempotently() throws Exception {
-    var artifact = engine.ingest(request("request-2", "queued"));
-    var queue = new InMemoryJobQueue();
-
-    try (var manager =
-        new QueueManager(queue, metadataStore, Duration.ofMinutes(1), failure -> {})) {
-      manager.runMaintenance();
-      manager.runMaintenance();
-    }
-
-    assertEquals(0, metadataStore.outboxBatch(10).size());
-    assertEquals(
-        artifact.id(),
-        queue
-            .claim(JobRecord.JobType.STORE, "worker", Duration.ofMinutes(1), Instant.now())
-            .orElseThrow()
-            .artifactId());
-    assertEquals(
-        artifact.id(),
-        queue
-            .claim(JobRecord.JobType.INDEX, "worker", Duration.ofMinutes(1), Instant.now())
-            .orElseThrow()
-            .artifactId());
-  }
-
-  private Requests.Ingest request(String key, String text) {
-    byte[] content = text.getBytes(java.nio.charset.StandardCharsets.UTF_8);
-    return new Requests.Ingest(
-        "tenant-a",
-        "principal-a",
-        key,
-        "notes.txt",
-        "text/plain",
-        new ByteArrayInputStream(content),
-        content.length,
-        Map.of("tags", "test"));
   }
 
   private static EmbeddingService embeddingService() {

@@ -11,8 +11,6 @@ public interface JobQueue {
 
   Optional<JobRecord> claim(JobRecord.JobType type, String owner, Duration lease, Instant now);
 
-  boolean renew(String jobId, String owner, Duration lease, Instant now);
-
   boolean complete(String jobId, String owner);
 
   boolean retry(String jobId, String owner, Instant nextAttempt, String error);

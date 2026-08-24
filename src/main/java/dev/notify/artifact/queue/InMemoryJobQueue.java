@@ -38,19 +38,6 @@ public final class InMemoryJobQueue implements JobQueue {
     return updateOwned(id, owner, JobRecord.JobStatus.COMPLETED, null, null);
   }
 
-  @Override
-  public synchronized boolean renew(String id, String owner, Duration lease, Instant now) {
-    JobRecord job = jobs.get(id);
-    if (job == null
-        || !Objects.equals(owner, job.leaseOwner())
-        || job.leaseExpiresAt() == null
-        || !job.leaseExpiresAt().isAfter(now)) {
-      return false;
-    }
-    jobs.put(id, job.renewed(now.plus(lease)));
-    return true;
-  }
-
   public synchronized boolean retry(String id, String owner, Instant next, String error) {
     return updateOwned(id, owner, JobRecord.JobStatus.RETRY_PENDING, next, error);
   }

@@ -119,7 +119,7 @@ public final class IngestJob extends AbstractJob<Artifact> implements DirectJob<
       List<JobRecord> operations = initialOperations(artifact);
       MetadataStore.Registration registration =
           metadataStore.register(
-              artifact, workflowManager == null ? operations : List.of(), options.deduplicateContent());
+              artifact, options.deduplicateContent());
       if (registration.outcome() == MetadataStore.Registration.Outcome.CREATED
           && workflowManager != null) {
         workflowManager.create(

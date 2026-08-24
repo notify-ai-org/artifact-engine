@@ -28,6 +28,38 @@ class WorkerManagerTest {
   }
 
   @Test
+  void constructorInitializesPoolAndAddExpandsOnlyToConfiguredLimit() {
+    List<WorkerManager.WorkerConfiguration> initialWorkers =
+        List.of(
+            new WorkerManager.WorkerConfiguration("initial-1", 8),
+            new WorkerManager.WorkerConfiguration("initial-2", 8));
+
+    try (WorkerManager manager = new WorkerManager(initialWorkers, 3)) {
+      assertEquals(2, manager.size());
+      assertEquals(3, manager.maxWorkers());
+      manager.add("expanded", 8);
+      assertEquals(3, manager.size());
+
+      assertThrows(IllegalStateException.class, () -> manager.add("too-many", 8));
+    }
+  }
+
+  @Test
+  void rejectsInvalidInitialPoolLimits() {
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> new WorkerManager(List.of(new WorkerManager.WorkerConfiguration("worker", 8)), 0));
+    assertThrows(
+        IllegalArgumentException.class,
+        () ->
+            new WorkerManager(
+                List.of(
+                    new WorkerManager.WorkerConfiguration("worker-1", 8),
+                    new WorkerManager.WorkerConfiguration("worker-2", 8)),
+                1));
+  }
+
+  @Test
   void restoreRecreatesWorkerWithSnapshottedConfiguration() throws IOException {
     Instant lastUsed = Instant.parse("2026-08-10T10:15:30Z");
     WorkerManager.WorkerSnapshot saved =

@@ -20,9 +20,10 @@ public final class JobStateMachines {
   private static Map<State, Set<State>> graph() {
     return Map.of(
         State.PENDING, Set.of(State.VALIDATING, State.CANCELLED),
-        State.VALIDATING, Set.of(State.BUFFERED, State.DEAD_LETTER),
+        State.VALIDATING, Set.of(State.BUFFERED, State.DEAD_LETTER, State.CANCELLED),
         State.BUFFERED, Set.of(State.RUNNING, State.CANCELLED),
-        State.RUNNING, Set.of(State.COMPLETED, State.RETRY_PENDING, State.DEAD_LETTER),
+        State.RUNNING,
+            Set.of(State.COMPLETED, State.RETRY_PENDING, State.DEAD_LETTER, State.CANCELLED),
         State.RETRY_PENDING, Set.of(State.BUFFERED, State.DEAD_LETTER));
   }
 

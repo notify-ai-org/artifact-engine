@@ -6,7 +6,6 @@ import dev.notify.artifact.auth.ArtifactAccessVerifier;
 import dev.notify.artifact.auth.DataVerifier;
 import dev.notify.artifact.embed.EmbeddingService;
 import dev.notify.artifact.job.DeleteJob;
-import dev.notify.artifact.job.ExtractedTextJob;
 import dev.notify.artifact.job.FetchJob;
 import dev.notify.artifact.job.IngestJob;
 import dev.notify.artifact.job.Job;
@@ -114,7 +113,7 @@ public final class DefaultArtifactJobFactory implements ArtifactJobFactory {
   @Override
   public Job<String> createExtractedText(
       String principalId, String tenantId, String artifactId, int maxCharacters) {
-    return new ExtractedTextJob(
+    return new RetrievalJob.ExtractedText(
         principalId,
         tenantId,
         artifactId,

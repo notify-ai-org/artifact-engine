@@ -16,42 +16,45 @@ import org.junit.jupiter.api.Test;
 
 class QueueManagerTest {
   @Test
-  void createsAndRoutesToSeparateTenantQueues() {
-    try (QueueManager manager = new QueueManager(tenant -> new InMemoryJobQueue())) {
-      manager.enqueue(job("a-1", "tenant-a"));
-      manager.enqueue(job("b-1", "tenant-b"));
+  void createsAndRoutesToSeparateJobTypeQueues() {
+    try (QueueManager manager = new QueueManager(type -> new InMemoryJobQueue())) {
+      manager.enqueue(job("store-1", "tenant-a", JobRecord.JobType.STORE));
+      manager.enqueue(job("index-1", "tenant-a", JobRecord.JobType.INDEX));
 
-      JobQueue tenantA = manager.queue("tenant-a").orElseThrow();
-      JobQueue tenantB = manager.queue("tenant-b").orElseThrow();
-      assertNotSame(tenantA, tenantB);
-      assertEquals("a-1", claim(tenantA));
-      assertEquals("b-1", claim(tenantB));
+      JobQueue store = manager.queue(JobRecord.JobType.STORE).orElseThrow();
+      JobQueue index = manager.queue(JobRecord.JobType.INDEX).orElseThrow();
+      assertNotSame(store, index);
+      assertEquals("store-1", claim(store, JobRecord.JobType.STORE));
+      assertEquals("index-1", claim(index, JobRecord.JobType.INDEX));
     }
   }
 
   @Test
   void addsAndRemovesQueuesWithoutAllowingSharingOrReplacement() {
-    InMemoryJobQueue tenantA = new InMemoryJobQueue();
-    InMemoryJobQueue tenantB = new InMemoryJobQueue();
-    try (QueueManager manager = new QueueManager(tenant -> new InMemoryJobQueue())) {
-      manager.addQueue("tenant-a", tenantA);
-      manager.addQueue("tenant-b", tenantB);
+    InMemoryJobQueue store = new InMemoryJobQueue();
+    InMemoryJobQueue index = new InMemoryJobQueue();
+    try (QueueManager manager = new QueueManager(type -> new InMemoryJobQueue())) {
+      manager.addQueue(JobRecord.JobType.STORE, store);
+      manager.addQueue(JobRecord.JobType.INDEX, index);
 
-      assertThrows(IllegalStateException.class, () -> manager.addQueue("tenant-a", tenantB));
       assertThrows(
-          IllegalArgumentException.class, () -> manager.addQueue("tenant-c", tenantB));
-      assertEquals(tenantA, manager.removeQueue("tenant-a").orElseThrow());
-      assertTrue(manager.queue("tenant-a").isEmpty());
-      assertTrue(manager.removeQueue("tenant-a").isEmpty());
+          IllegalStateException.class,
+          () -> manager.addQueue(JobRecord.JobType.STORE, index));
+      assertThrows(
+          IllegalArgumentException.class,
+          () -> manager.addQueue(JobRecord.JobType.FETCH, index));
+      assertEquals(store, manager.removeQueue(JobRecord.JobType.STORE).orElseThrow());
+      assertTrue(manager.queue(JobRecord.JobType.STORE).isEmpty());
+      assertTrue(manager.removeQueue(JobRecord.JobType.STORE).isEmpty());
     }
   }
 
   @Test
-  void concurrentFirstUseCreatesOneQueuePerTenant() throws Exception {
+  void concurrentFirstUseCreatesOneQueuePerJobType() throws Exception {
     List<JobQueue> created = java.util.Collections.synchronizedList(new ArrayList<>());
     try (QueueManager manager =
             new QueueManager(
-                tenant -> {
+                type -> {
                   JobQueue queue = new InMemoryJobQueue();
                   created.add(queue);
                   return queue;
@@ -63,7 +66,7 @@ class QueueManagerTest {
         int id = index;
         operations.add(
             () -> {
-              manager.enqueue(job("job-" + id, "tenant-a"));
+              manager.enqueue(job("job-" + id, "tenant-a", JobRecord.JobType.INDEX));
               return null;
             });
       }
@@ -73,15 +76,34 @@ class QueueManagerTest {
     }
   }
 
-  private static String claim(JobQueue queue) {
+  @Test
+  void exposesLeaseOperationsWithoutLeakingTheUnderlyingQueue() {
+    try (QueueManager manager = new QueueManager()) {
+      manager.enqueue(job("job", "tenant", JobRecord.JobType.INDEX));
+      Instant now = Instant.now();
+      JobRecord claimed =
+          manager
+              .claim(JobRecord.JobType.INDEX, "worker", Duration.ofMinutes(1), now)
+              .orElseThrow();
+
+      assertEquals("job", claimed.id());
+      assertTrue(manager.complete(JobRecord.JobType.INDEX, "job", "worker"));
+    }
+  }
+
+  private static String claim(JobQueue queue, JobRecord.JobType type) {
     return queue
-        .claim(JobRecord.JobType.INDEX, "worker", Duration.ofMinutes(1), Instant.now())
+        .claim(type, "worker", Duration.ofMinutes(1), Instant.now())
         .orElseThrow()
         .id();
   }
 
   private static JobRecord job(String id, String tenant) {
-    return JobRecord.pending(id, tenant, "artifact", JobRecord.JobType.INDEX, Map.of());
+    return job(id, tenant, JobRecord.JobType.INDEX);
+  }
+
+  private static JobRecord job(String id, String tenant, JobRecord.JobType type) {
+    return JobRecord.pending(id, tenant, "artifact", type, Map.of());
   }
 
   private static final class ExecutorCloser implements AutoCloseable {

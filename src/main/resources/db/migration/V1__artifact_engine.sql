@@ -26,14 +26,6 @@ CREATE INDEX ix_artifact_spool_path ON artifact (spool_path);
 CREATE INDEX ix_artifact_tenant_media_status
     ON artifact (tenant_id, media_type, index_status);
 
-CREATE TABLE artifact_outbox (
-    id VARCHAR(64) PRIMARY KEY,
-    job_json TEXT NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL
-);
-
-CREATE INDEX ix_artifact_outbox_created ON artifact_outbox (created_at);
-
 CREATE TABLE artifact_audit_log (
     id VARCHAR(36) PRIMARY KEY,
     operation VARCHAR(80) NOT NULL,

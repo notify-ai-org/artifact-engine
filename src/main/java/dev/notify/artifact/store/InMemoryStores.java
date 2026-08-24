@@ -3,12 +3,10 @@ package dev.notify.artifact.store;
 import dev.notify.artifact.exception.IdempotencyConflictException;
 import dev.notify.artifact.model.Artifact;
 import dev.notify.artifact.model.ArtifactChunk;
-import dev.notify.artifact.model.JobRecord;
 import dev.notify.artifact.util.VectorUtils;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Comparator;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -30,7 +28,6 @@ public final class InMemoryStores {
 
   public static final class Metadata implements MetadataStore {
     private final Map<String, Artifact> artifacts = new ConcurrentHashMap<>();
-    private final Map<String, JobRecord> outbox = new LinkedHashMap<>();
 
     @Override
     public Artifact save(Artifact artifact) {
@@ -58,7 +55,7 @@ public final class InMemoryStores {
 
     @Override
     public synchronized Registration register(
-        Artifact candidate, List<JobRecord> initialOperations, boolean deduplicateByChecksum) {
+        Artifact candidate, boolean deduplicateByChecksum) {
       Optional<Artifact> idempotent =
           findByIdempotencyKey(candidate.tenantId(), candidate.idempotencyKey());
       if (idempotent.isPresent()) {
@@ -76,7 +73,6 @@ public final class InMemoryStores {
         }
       }
       artifacts.put(key(candidate.tenantId(), candidate.id()), candidate);
-      initialOperations.forEach(operation -> outbox.putIfAbsent(operation.id(), operation));
       return new Registration(Registration.Outcome.CREATED, candidate);
     }
 
@@ -121,17 +117,7 @@ public final class InMemoryStores {
           .toList();
     }
 
-    @Override
-    public synchronized List<JobRecord> outboxBatch(int limit) {
-      return outbox.values().stream().limit(Math.max(0, limit)).toList();
-    }
-
-    @Override
-    public synchronized void markOutboxDispatched(String operationId) {
-      outbox.remove(operationId);
-    }
   }
-
   public static final class Vectors implements VectorStore {
     private final Map<String, ArtifactChunk> chunks = new ConcurrentHashMap<>();
 

@@ -1,5 +1,8 @@
 package dev.notify.artifact.worker;
 
+import dev.notify.artifact.model.JobRecord;
+import dev.notify.artifact.queue.QueueManager;
+import dev.notify.artifact.retry.RetryPolicy;
 import java.io.IOException;
 import java.time.Duration;
 import java.time.Instant;
@@ -18,27 +21,84 @@ public final class WorkerManager implements AutoCloseable {
   public static final int DEFAULT_BATCH_SIZE = 16;
   public static final long DEFAULT_BATCH_BYTES = 16;
   public static final Duration DEFAULT_FLUSH_INTERVAL = Duration.ofMillis(250);
+  public static final int DEFAULT_MAX_WORKERS = 64;
 
   private final Map<String, Managed> workers = new ConcurrentHashMap<>();
   private final java.util.function.Consumer<Worker.JobFailure> failureHandler;
   private final WorkerSnapshotStore snapshotStore;
+  private final int maxWorkers;
+  private final QueueManager queueManager;
+  private final JobRecordExecutor jobExecutor;
   private final List<Consumer<Worker.StateChange>> stateChangeListeners =
       new CopyOnWriteArrayList<>();
   private final Map<String, Worker.StateChange> latestStateChanges = new ConcurrentHashMap<>();
 
   public WorkerManager(java.util.function.Consumer<Worker.JobFailure> failureHandler) {
-    this(failureHandler, null);
+    this(failureHandler, null, List.of(), DEFAULT_MAX_WORKERS);
   }
 
   public WorkerManager(
       java.util.function.Consumer<Worker.JobFailure> failureHandler,
       WorkerSnapshotStore snapshotStore) {
+    this(failureHandler, snapshotStore, List.of(), DEFAULT_MAX_WORKERS);
+  }
+
+  public WorkerManager(List<WorkerConfiguration> initialWorkers, int maxWorkers) {
+    this(failure -> {}, null, initialWorkers, maxWorkers);
+  }
+
+  public WorkerManager(
+      java.util.function.Consumer<Worker.JobFailure> failureHandler,
+      WorkerSnapshotStore snapshotStore,
+      List<WorkerConfiguration> initialWorkers,
+      int maxWorkers) {
+    this(
+        failureHandler,
+        snapshotStore,
+        initialWorkers,
+        maxWorkers,
+        new QueueManager(),
+        ignored -> () -> null);
+  }
+
+  public WorkerManager(
+      java.util.function.Consumer<Worker.JobFailure> failureHandler,
+      WorkerSnapshotStore snapshotStore,
+      List<WorkerConfiguration> initialWorkers,
+      int maxWorkers,
+      QueueManager queueManager,
+      JobRecordExecutor jobExecutor) {
     this.failureHandler = Objects.requireNonNull(failureHandler, "failureHandler");
     this.snapshotStore = snapshotStore;
+    this.queueManager = Objects.requireNonNull(queueManager, "queueManager");
+    this.jobExecutor = Objects.requireNonNull(jobExecutor, "jobExecutor");
+    if (maxWorkers < 1) {
+      throw new IllegalArgumentException("maxWorkers must be positive");
+    }
+    List<WorkerConfiguration> configuredWorkers =
+        List.copyOf(Objects.requireNonNull(initialWorkers, "initialWorkers"));
+    if (configuredWorkers.size() > maxWorkers) {
+      throw new IllegalArgumentException("Initial worker count exceeds maxWorkers");
+    }
+    this.maxWorkers = maxWorkers;
+    try {
+      for (WorkerConfiguration worker : configuredWorkers) {
+        add(
+            worker.id(),
+            worker.queueCapacity(),
+            worker.batchSize(),
+            worker.batchBytes(),
+            worker.flushInterval(),
+            worker.type());
+      }
+    } catch (RuntimeException failure) {
+      close();
+      throw failure;
+    }
   }
 
   public WorkerManager() {
-    this(failure -> {});
+    this(failure -> {}, null, List.of(), DEFAULT_MAX_WORKERS);
   }
 
   public int restore() throws IOException {
@@ -54,6 +114,7 @@ public final class WorkerManager implements AutoCloseable {
             snapshot.batchSize(),
             snapshot.batchBytes(),
             snapshot.flushInterval(),
+            snapshot.type(),
             snapshot.lastUsed());
         restored++;
       }
@@ -92,35 +153,62 @@ public final class WorkerManager implements AutoCloseable {
       int batchSize,
       long batchBytes,
       Duration flushInterval) {
-    return add(id, queueCapacity, batchSize, batchBytes, flushInterval, Instant.now());
+    return add(
+        id,
+        queueCapacity,
+        batchSize,
+        batchBytes,
+        flushInterval,
+        JobRecord.JobType.INDEX);
   }
 
-  private Worker add(
+  public Worker add(
       String id,
       int queueCapacity,
       int batchSize,
       long batchBytes,
       Duration flushInterval,
+      JobRecord.JobType type) {
+    return add(id, queueCapacity, batchSize, batchBytes, flushInterval, type, Instant.now());
+  }
+
+  private synchronized Worker add(
+      String id,
+      int queueCapacity,
+      int batchSize,
+      long batchBytes,
+      Duration flushInterval,
+      JobRecord.JobType type,
       Instant lastUsed) {
     WorkerSettings settings =
-        new WorkerSettings(queueCapacity, batchSize, batchBytes, flushInterval);
+        new WorkerSettings(queueCapacity, batchSize, batchBytes, flushInterval, type);
+    if (workers.containsKey(id)) {
+      throw new IllegalArgumentException("Worker exists: " + id);
+    }
+    if (workers.size() >= maxWorkers) {
+      throw new IllegalStateException("Worker pool limit reached: " + maxWorkers);
+    }
     Worker worker =
         new Worker(
             id,
-            settings.queueCapacity(),
             settings.batchSize(),
             settings.batchBytes(),
-            null, null, null, settings.flushInterval(),
-            flushInterval, flushInterval, failureHandler);
+            settings.type(),
+            queueManager,
+            RetryPolicy.defaults(),
+            settings.flushInterval(),
+            flushInterval,
+            flushInterval,
+            failureHandler,
+            jobExecutor);
     Managed managed = new Managed(worker, settings, Objects.requireNonNull(lastUsed, "lastUsed"));
-    if (workers.putIfAbsent(id, managed) != null)
-      throw new IllegalArgumentException("Worker exists: " + id);
+    workers.put(id, managed);
     worker.onStateChange(this::handleStateChange);
     worker.start();
     return worker;
   }
 
-  public void remove(String id) {
+  public synchronized void remove(String id) {
     Managed managed = workers.remove(id);
     if (managed != null) managed.worker.close();
   }
@@ -132,7 +220,7 @@ public final class WorkerManager implements AutoCloseable {
         .entrySet()
         .removeIf(
             e -> {
-              if (e.getValue().lastUsed.isBefore(cutoff) && e.getValue().worker.queued() == 0) {
+              if (e.getValue().lastUsed.isBefore(cutoff)) {
                 e.getValue().worker.close();
                 return true;
               }
@@ -150,12 +238,21 @@ public final class WorkerManager implements AutoCloseable {
                 new WorkerSnapshot(
                     id,
                     m.settings.queueCapacity(),
-                    m.worker.queued(),
+                    0,
                     m.lastUsed,
                     m.settings.batchSize(),
                     m.settings.batchBytes(),
-                    m.settings.flushInterval())));
+                    m.settings.flushInterval(),
+                    m.settings.type())));
     return Map.copyOf(result);
+  }
+
+  public int size() {
+    return workers.size();
+  }
+
+  public int maxWorkers() {
+    return maxWorkers;
   }
 
   public void addStateChangeListener(Consumer<Worker.StateChange> listener) {
@@ -181,7 +278,7 @@ public final class WorkerManager implements AutoCloseable {
     }
   }
 
-  public void close() {
+  public synchronized void close() {
     workers.values().forEach(m -> m.worker.close());
     workers.clear();
   }
@@ -199,7 +296,11 @@ public final class WorkerManager implements AutoCloseable {
   }
 
   private record WorkerSettings(
-      int queueCapacity, int batchSize, long batchBytes, Duration flushInterval) {
+      int queueCapacity,
+      int batchSize,
+      long batchBytes,
+      Duration flushInterval,
+      JobRecord.JobType type) {
     private WorkerSettings {
       if (queueCapacity < 1) {
         throw new IllegalArgumentException("queueCapacity must be positive");
@@ -213,6 +314,42 @@ public final class WorkerManager implements AutoCloseable {
       if (flushInterval == null || flushInterval.isZero() || flushInterval.isNegative()) {
         throw new IllegalArgumentException("flushInterval must be positive");
       }
+      Objects.requireNonNull(type, "type");
+    }
+  }
+
+  /** Configuration for a worker created as part of the manager's initial pool. */
+  public record WorkerConfiguration(
+      String id,
+      int queueCapacity,
+      int batchSize,
+      long batchBytes,
+      Duration flushInterval,
+      JobRecord.JobType type) {
+    public WorkerConfiguration(String id, int queueCapacity) {
+      this(
+          id,
+          queueCapacity,
+          DEFAULT_BATCH_SIZE,
+          DEFAULT_BATCH_BYTES,
+          DEFAULT_FLUSH_INTERVAL,
+          JobRecord.JobType.INDEX);
+    }
+
+    public WorkerConfiguration(
+        String id,
+        int queueCapacity,
+        int batchSize,
+        long batchBytes,
+        Duration flushInterval) {
+      this(id, queueCapacity, batchSize, batchBytes, flushInterval, JobRecord.JobType.INDEX);
+    }
+
+    public WorkerConfiguration {
+      if (id == null || id.isBlank()) {
+        throw new IllegalArgumentException("Worker id is required");
+      }
+      new WorkerSettings(queueCapacity, batchSize, batchBytes, flushInterval, type);
     }
   }
 
@@ -224,7 +361,8 @@ public final class WorkerManager implements AutoCloseable {
       Instant lastUsed,
       int batchSize,
       long batchBytes,
-      Duration flushInterval) {
+      Duration flushInterval,
+      JobRecord.JobType type) {
 
     /** Source-compatible constructor for snapshot stores written before batch settings existed. */
     public WorkerSnapshot(String id, int capacity, int queuedJobs, Instant lastUsed) {
@@ -235,7 +373,27 @@ public final class WorkerManager implements AutoCloseable {
           lastUsed,
           DEFAULT_BATCH_SIZE,
           DEFAULT_BATCH_BYTES,
-          DEFAULT_FLUSH_INTERVAL);
+          DEFAULT_FLUSH_INTERVAL,
+          JobRecord.JobType.INDEX);
+    }
+
+    public WorkerSnapshot(
+        String id,
+        int capacity,
+        int queuedJobs,
+        Instant lastUsed,
+        int batchSize,
+        long batchBytes,
+        Duration flushInterval) {
+      this(
+          id,
+          capacity,
+          queuedJobs,
+          lastUsed,
+          batchSize,
+          batchBytes,
+          flushInterval,
+          JobRecord.JobType.INDEX);
     }
 
     public WorkerSnapshot {
@@ -246,6 +404,7 @@ public final class WorkerManager implements AutoCloseable {
           flushInterval == null || flushInterval.isZero() || flushInterval.isNegative()
               ? DEFAULT_FLUSH_INTERVAL
               : flushInterval;
+      type = type == null ? JobRecord.JobType.INDEX : type;
     }
   }
 }

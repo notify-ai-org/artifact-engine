@@ -71,21 +71,6 @@ public final class RedisJobQueue implements JobQueue {
           return 1
           """;
 
-  private static final String RENEW =
-          """
-          local json = redis.call('GET', KEYS[1])
-          if not json then return 0 end
-          local job = cjson.decode(json)
-          if job.leaseOwner ~= ARGV[1] then return 0 end
-          local leaseScore = redis.call('ZSCORE', KEYS[2], job.id)
-          if not leaseScore or tonumber(leaseScore) <= tonumber(ARGV[2]) then return 0 end
-          job.leaseExpiresAt = ARGV[3]
-          job.updatedAt = ARGV[4]
-          redis.call('SET', KEYS[1], cjson.encode(job))
-          redis.call('ZADD', KEYS[2], ARGV[5], job.id)
-          return 1
-          """;
-
   private static final String RECOVER =
           """
           local ids = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, ARGV[2])
@@ -161,22 +146,6 @@ public final class RedisJobQueue implements JobQueue {
   @Override
   public boolean complete(String jobId, String owner) {
     return finish(jobId, owner, JobRecord.JobStatus.COMPLETED, null, null);
-  }
-
-  @Override
-  public boolean renew(String jobId, String owner, Duration lease, Instant now) {
-    Instant expiry = now.plus(lease);
-    Long renewed =
-        redis.eval(
-            RENEW,
-            ScriptOutputType.INTEGER,
-            new String[] {jobKey(jobId), leasedKey()},
-            owner,
-            Long.toString(now.toEpochMilli()),
-            expiry.toString(),
-            now.toString(),
-            Long.toString(expiry.toEpochMilli()));
-    return renewed != null && renewed == 1;
   }
 
   @Override

@@ -31,6 +31,7 @@ public final class DefaultArtifactEngine implements ArtifactEngine {
   public DefaultArtifactEngine(ArtifactJobFactory jobFactory, JobDispatcher dispatcher) {
     this.jobFactory = Objects.requireNonNull(jobFactory, "jobFactory");
     this.dispatcher = Objects.requireNonNull(dispatcher, "dispatcher");
+    
   }
 
   public DefaultArtifactEngine(

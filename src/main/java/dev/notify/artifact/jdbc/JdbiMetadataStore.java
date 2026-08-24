@@ -4,7 +4,6 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.notify.artifact.exception.IdempotencyConflictException;
 import dev.notify.artifact.model.Artifact;
-import dev.notify.artifact.model.JobRecord;
 import dev.notify.artifact.store.MetadataStore;
 import java.nio.file.Path;
 import java.util.Arrays;
@@ -116,9 +115,8 @@ public final class JdbiMetadataStore implements MetadataStore {
 
   @Override
   public Registration register(
-      Artifact candidate, List<JobRecord> initialOperations, boolean deduplicateByChecksum) {
+      Artifact candidate, boolean deduplicateByChecksum) {
     Objects.requireNonNull(candidate, "candidate");
-    List<JobRecord> operations = List.copyOf(initialOperations);
     return jdbi.inTransaction(
         handle -> {
           Optional<Artifact> idempotent =
@@ -141,19 +139,6 @@ public final class JdbiMetadataStore implements MetadataStore {
                     .orElseThrow(
                         () -> new IllegalStateException("Artifact registration conflict"));
             return replay(candidate, raced);
-          }
-          for (JobRecord operation : operations) {
-            handle
-                .createUpdate(
-                    """
-                    INSERT INTO artifact_outbox (id, job_json, created_at)
-                    VALUES (:id, :jobJson, :createdAt)
-                    ON CONFLICT (id) DO NOTHING
-                    """)
-                .bind("id", operation.id())
-                .bind("jobJson", serialize(operation))
-                .bind("createdAt", operation.createdAt())
-                .execute();
           }
           return new Registration(Registration.Outcome.CREATED, candidate);
         });
@@ -209,32 +194,6 @@ public final class JdbiMetadataStore implements MetadataStore {
                 .mapTo(String.class)
                 .map(this::deserializeArtifact)
                 .list());
-  }
-
-  @Override
-  public List<JobRecord> outboxBatch(int limit) {
-    return jdbi.withHandle(
-        handle ->
-            handle
-                .createQuery(
-                    "SELECT job_json FROM artifact_outbox ORDER BY created_at ASC LIMIT :limit")
-                .bind("limit", boundedLimit(limit))
-                .mapTo(String.class)
-                .map(this::deserializeJob)
-                .list());
-  }
-
-  @Override
-  public void markOutboxDispatched(String operationId) {
-    if (operationId == null || operationId.isBlank()) {
-      throw new IllegalArgumentException("operationId is required");
-    }
-    jdbi.useHandle(
-        handle ->
-            handle
-                .createUpdate("DELETE FROM artifact_outbox WHERE id = :id")
-                .bind("id", operationId)
-                .execute());
   }
 
   private int insert(Handle handle, Artifact artifact) {
@@ -339,10 +298,6 @@ public final class JdbiMetadataStore implements MetadataStore {
 
   private Artifact deserializeArtifact(String value) {
     return deserialize(value, Artifact.class);
-  }
-
-  private JobRecord deserializeJob(String value) {
-    return deserialize(value, JobRecord.class);
   }
 
   private <T> T deserialize(String value, Class<T> type) {

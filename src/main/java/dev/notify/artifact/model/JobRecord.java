@@ -51,23 +51,6 @@ public record JobRecord(
         Instant.now());
   }
 
-  public JobRecord renewed(Instant expiry) {
-    return new JobRecord(
-        id,
-        tenantId,
-        artifactId,
-        type,
-        status,
-        attempts,
-        nextAttemptAt,
-        leaseOwner,
-        expiry,
-        attributes,
-        lastError,
-        createdAt,
-        Instant.now());
-  }
-
   public static JobRecord pending(
       String id, String tenantId, String artifactId, JobType type, Map<String, String> attributes) {
     Instant now = Instant.now();

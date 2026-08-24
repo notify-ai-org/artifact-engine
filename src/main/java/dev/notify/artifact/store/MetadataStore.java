@@ -1,7 +1,6 @@
 package dev.notify.artifact.store;
 
 import dev.notify.artifact.model.Artifact;
-import dev.notify.artifact.model.JobRecord;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Optional;
@@ -13,9 +12,9 @@ public interface MetadataStore extends Store<Artifact> {
   /** Atomically applies a lifecycle update to the latest persisted version. */
   Artifact update(String tenantId, String artifactId, UnaryOperator<Artifact> update);
 
-  /** Atomically stores a new artifact and its initial transactional-outbox operations. */
+  /** Atomically stores a new artifact */
   Registration register(
-      Artifact candidate, List<JobRecord> initialOperations, boolean deduplicateByChecksum);
+      Artifact candidate, boolean deduplicateByChecksum);
 
   Optional<Artifact> find(String tenantId, String artifactId);
 
@@ -26,10 +25,6 @@ public interface MetadataStore extends Store<Artifact> {
   Optional<Artifact> findBySpoolPath(Path spoolPath);
 
   List<Artifact> list(String tenantId, int limit);
-
-  List<JobRecord> outboxBatch(int limit);
-
-  void markOutboxDispatched(String operationId);
 
   record Registration(Outcome outcome, Artifact artifact) {
     public enum Outcome {
