@@ -49,6 +49,14 @@ public final class RedisJobQueue implements JobQueue {
           return updated
           """;
 
+  private static final String REQUEUE =
+          """
+          redis.call('SET', KEYS[1], ARGV[1])
+          redis.call('ZREM', KEYS[2], ARGV[2])
+          redis.call('ZADD', KEYS[3], ARGV[3], ARGV[2])
+          return 1
+          """;
+
   private static final String FINISH =
           """
           local json = redis.call('GET', KEYS[1])
@@ -123,6 +131,17 @@ public final class RedisJobQueue implements JobQueue {
         serialize(job),
         Long.toString(score(job.nextAttemptAt())),
         job.id());
+  }
+
+  @Override
+  public void requeue(JobRecord job) {
+    redis.eval(
+        REQUEUE,
+        ScriptOutputType.INTEGER,
+        new String[] {jobKey(job.id()), leasedKey(), readyKey(job.type())},
+        serialize(job),
+        job.id(),
+        Long.toString(score(job.nextAttemptAt())));
   }
 
   @Override

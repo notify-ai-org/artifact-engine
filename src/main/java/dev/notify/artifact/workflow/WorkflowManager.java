@@ -93,8 +93,9 @@ public final class WorkflowManager implements AutoCloseable, Consumer<Worker.Sta
 
   public void start() {
     if (!started.compareAndSet(false, true)) return;
+    safeRecover();
     scheduler.scheduleWithFixedDelay(
-        this::safeDispatch, 0, pollInterval.toMillis(), TimeUnit.MILLISECONDS);
+        this::safeDispatch, pollInterval.toMillis(), pollInterval.toMillis(), TimeUnit.MILLISECONDS);
   }
 
   public void runOnce() {
@@ -198,6 +199,25 @@ public final class WorkflowManager implements AutoCloseable, Consumer<Worker.Sta
       runOnce();
     } catch (Throwable failure) {
       failureHandler.accept(failure);
+    }
+  }
+
+  private void safeRecover() {
+    try {
+      for (Workflow workflow : store.recoverable()) dispatchPendingSteps(workflow);
+    } catch (Throwable failure) {
+      failureHandler.accept(failure);
+    }
+  }
+
+  private void dispatchPendingSteps(Workflow workflow) {
+    Instant now = Instant.now();
+    for (WorkflowStep step : workflow.workflowSteps()) {
+      if (step.status() == WorkflowStepStatus.PENDING
+          || step.status() == WorkflowStepStatus.SUBMITTED
+          || step.status() == WorkflowStepStatus.RUNNING) {
+        queues.requeue(step.jobRecord(), now);
+      }
     }
   }
 

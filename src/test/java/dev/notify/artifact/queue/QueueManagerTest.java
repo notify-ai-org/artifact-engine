@@ -91,6 +91,34 @@ class QueueManagerTest {
     }
   }
 
+  @Test
+  void claimedJobIsRemovedFromReadyQueue() {
+    InMemoryJobQueue queue = new InMemoryJobQueue();
+    queue.enqueue(job("job", "tenant"));
+    Instant now = Instant.now();
+
+    assertTrue(queue.claim(JobRecord.JobType.INDEX, "worker-1", Duration.ofMinutes(1), now).isPresent());
+    assertTrue(queue.claim(JobRecord.JobType.INDEX, "worker-2", Duration.ofMinutes(1), now).isEmpty());
+  }
+
+  @Test
+  void startupRequeueClearsAStaleLeaseAndMakesTheJobClaimable() {
+    try (QueueManager manager = new QueueManager()) {
+      Instant now = Instant.now();
+      JobRecord stale = job("store", "tenant", JobRecord.JobType.STORE)
+          .claimed("old-worker", now.plus(Duration.ofMinutes(15)));
+
+      manager.requeue(stale, now);
+
+      JobRecord recovered = manager
+          .claim(JobRecord.JobType.STORE, "new-worker", Duration.ofMinutes(1), now)
+          .orElseThrow();
+      assertEquals("store", recovered.id());
+      assertEquals("new-worker", recovered.leaseOwner());
+      assertEquals(2, recovered.attempts());
+    }
+  }
+
   private static String claim(JobQueue queue, JobRecord.JobType type) {
     return queue
         .claim(type, "worker", Duration.ofMinutes(1), Instant.now())

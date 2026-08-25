@@ -119,6 +119,27 @@ public final class QueueManager implements AutoCloseable {
     queueFor(job.type()).enqueue(job);
   }
 
+  public void requeue(JobRecord operation, Instant now) {
+    JobRecord job = Objects.requireNonNull(operation, "operation");
+    Instant recoveredAt = Objects.requireNonNull(now, "now");
+    JobRecord recovered =
+        new JobRecord(
+            job.id(),
+            job.tenantId(),
+            job.artifactId(),
+            job.type(),
+            JobRecord.JobStatus.RETRY_PENDING,
+            job.attempts(),
+            recoveredAt,
+            null,
+            null,
+            job.attributes(),
+            job.lastError(),
+            job.createdAt(),
+            recoveredAt);
+    queueFor(job.type()).requeue(recovered);
+  }
+
   public Optional<JobRecord> claim(
       JobRecord.JobType type, String owner, Duration lease, Instant now) {
     return queueFor(type).claim(type, owner, lease, now);

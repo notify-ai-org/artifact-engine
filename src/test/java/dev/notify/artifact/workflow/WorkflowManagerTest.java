@@ -12,9 +12,41 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.IntStream;
 import org.junit.jupiter.api.Test;
 
 class WorkflowManagerTest {
+  @Test
+  void startImmediatelyDispatchesPendingSubmittedAndRunningSteps() {
+    InMemoryWorkflowStore store = new InMemoryWorkflowStore();
+    int workflowCount = 501;
+    try (QueueManager setupQueues = new QueueManager();
+        WorkflowManager setup =
+            new WorkflowManager(store, setupQueues, Duration.ofHours(1), failure -> {})) {
+      IntStream.range(0, workflowCount).forEach(index -> {
+        Workflow workflow = setup.create("workflow-" + index,
+            List.of(job("first-" + index, JobRecord.JobType.STORE),
+                job("second-" + index, JobRecord.JobType.STORE)));
+        if (index % 3 != 0) setup.runOnce();
+        if (index % 3 == 2) {
+          setup.accept(stateChange("first-" + index, JobRecord.JobType.STORE,
+              JobStateMachines.State.RUNNING, "job running"));
+        }
+      });
+    }
+
+    try (QueueManager recoveredQueues = new QueueManager();
+        WorkflowManager recovered =
+            new WorkflowManager(store, recoveredQueues, Duration.ofHours(1), failure -> {})) {
+      recovered.start();
+
+      for (int index = 0; index < workflowCount * 2; index++) {
+        assertTrue(recoveredQueues.claim(JobRecord.JobType.STORE, "worker", Duration.ofMinutes(1),
+            Instant.now()).isPresent());
+      }
+    }
+  }
+
   @Test
   void submitsStepsSequentiallyAndCompletesWorkflow() {
     InMemoryWorkflowStore store = new InMemoryWorkflowStore();

@@ -4,6 +4,7 @@ import dev.notify.artifact.job.Job;
 import dev.notify.artifact.job.QueueableJob;
 import dev.notify.artifact.model.JobRecord;
 import dev.notify.artifact.queue.QueueManager;
+import dev.notify.artifact.store.JobStore;
 import java.util.Objects;
 
 /**
@@ -16,9 +17,15 @@ import java.util.Objects;
  */
 public final class QueuingJobDispatcher implements JobDispatcher {
   private final QueueManager queueManager;
+  private final JobStore jobStore;
 
   public QueuingJobDispatcher(QueueManager queueManager) {
+    this(queueManager, null);
+  }
+
+  public QueuingJobDispatcher(QueueManager queueManager, JobStore jobStore) {
     this.queueManager = Objects.requireNonNull(queueManager, "queueManager");
+    this.jobStore = jobStore;
   }
 
   @Override
@@ -31,6 +38,9 @@ public final class QueuingJobDispatcher implements JobDispatcher {
     @SuppressWarnings("unchecked")
     QueueableJob<R> queueableJob = (QueueableJob<R>) job;
     JobRecord record = requirePending(queueableJob.queueRecord());
+    if (jobStore != null) {
+      jobStore.create(record);
+    }
     queueManager.enqueue(record);
     return queueableJob.queuedResult();
   }

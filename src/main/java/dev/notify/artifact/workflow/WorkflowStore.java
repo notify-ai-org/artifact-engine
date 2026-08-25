@@ -12,6 +12,9 @@ public interface WorkflowStore {
 
   Optional<Workflow> findByJobRecordId(String jobRecordId);
 
+  /** Returns all non-terminal workflows for startup recovery. */
+  List<Workflow> recoverable();
+
   List<Workflow> incomplete(int limit);
 
   Workflow update(String workflowId, UnaryOperator<Workflow> update);

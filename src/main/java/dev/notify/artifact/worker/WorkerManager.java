@@ -3,6 +3,7 @@ package dev.notify.artifact.worker;
 import dev.notify.artifact.model.JobRecord;
 import dev.notify.artifact.queue.QueueManager;
 import dev.notify.artifact.retry.RetryPolicy;
+import dev.notify.artifact.store.JobStore;
 import java.io.IOException;
 import java.time.Duration;
 import java.time.Instant;
@@ -21,6 +22,8 @@ public final class WorkerManager implements AutoCloseable {
   public static final int DEFAULT_BATCH_SIZE = 16;
   public static final long DEFAULT_BATCH_BYTES = 16;
   public static final Duration DEFAULT_FLUSH_INTERVAL = Duration.ofMillis(250);
+  public static final Duration DEFAULT_LEASE_DURATION = Duration.ofMinutes(15);
+  public static final Duration DEFAULT_POLL_INTERVAL = Duration.ofMillis(250);
   public static final int DEFAULT_MAX_WORKERS = 64;
 
   private final Map<String, Managed> workers = new ConcurrentHashMap<>();
@@ -29,6 +32,9 @@ public final class WorkerManager implements AutoCloseable {
   private final int maxWorkers;
   private final QueueManager queueManager;
   private final JobRecordExecutor jobExecutor;
+  private final JobStore jobStore;
+  private final Duration leaseDuration;
+  private final Duration pollInterval;
   private final List<Consumer<Worker.StateChange>> stateChangeListeners =
       new CopyOnWriteArrayList<>();
   private final Map<String, Worker.StateChange> latestStateChanges = new ConcurrentHashMap<>();
@@ -68,10 +74,47 @@ public final class WorkerManager implements AutoCloseable {
       int maxWorkers,
       QueueManager queueManager,
       JobRecordExecutor jobExecutor) {
+    this(
+        failureHandler, snapshotStore, initialWorkers, maxWorkers, queueManager, jobExecutor, null);
+  }
+
+  public WorkerManager(
+      java.util.function.Consumer<Worker.JobFailure> failureHandler,
+      WorkerSnapshotStore snapshotStore,
+      List<WorkerConfiguration> initialWorkers,
+      int maxWorkers,
+      QueueManager queueManager,
+      JobRecordExecutor jobExecutor,
+      JobStore jobStore) {
+    this(
+        failureHandler,
+        snapshotStore,
+        initialWorkers,
+        maxWorkers,
+        queueManager,
+        jobExecutor,
+        jobStore,
+        DEFAULT_LEASE_DURATION,
+        DEFAULT_POLL_INTERVAL);
+  }
+
+  public WorkerManager(
+      java.util.function.Consumer<Worker.JobFailure> failureHandler,
+      WorkerSnapshotStore snapshotStore,
+      List<WorkerConfiguration> initialWorkers,
+      int maxWorkers,
+      QueueManager queueManager,
+      JobRecordExecutor jobExecutor,
+      JobStore jobStore,
+      Duration leaseDuration,
+      Duration pollInterval) {
     this.failureHandler = Objects.requireNonNull(failureHandler, "failureHandler");
     this.snapshotStore = snapshotStore;
     this.queueManager = Objects.requireNonNull(queueManager, "queueManager");
     this.jobExecutor = Objects.requireNonNull(jobExecutor, "jobExecutor");
+    this.jobStore = jobStore;
+    this.leaseDuration = requirePositive(leaseDuration, "leaseDuration");
+    this.pollInterval = requirePositive(pollInterval, "pollInterval");
     if (maxWorkers < 1) {
       throw new IllegalArgumentException("maxWorkers must be positive");
     }
@@ -196,16 +239,25 @@ public final class WorkerManager implements AutoCloseable {
             settings.type(),
             queueManager,
             RetryPolicy.defaults(),
-            settings.flushInterval(),
-            flushInterval,
+            leaseDuration,
+            pollInterval,
             flushInterval,
             failureHandler,
-            jobExecutor);
+            jobExecutor,
+            jobStore);
     Managed managed = new Managed(worker, settings, Objects.requireNonNull(lastUsed, "lastUsed"));
     workers.put(id, managed);
     worker.onStateChange(this::handleStateChange);
     worker.start();
     return worker;
+  }
+
+  private static Duration requirePositive(Duration duration, String name) {
+    Objects.requireNonNull(duration, name);
+    if (duration.isZero() || duration.isNegative()) {
+      throw new IllegalArgumentException(name + " must be positive");
+    }
+    return duration;
   }
 
   public synchronized void remove(String id) {

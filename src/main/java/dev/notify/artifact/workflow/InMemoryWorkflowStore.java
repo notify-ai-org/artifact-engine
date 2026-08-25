@@ -30,6 +30,14 @@ public final class InMemoryWorkflowStore implements WorkflowStore {
   }
 
   @Override
+  public synchronized List<Workflow> recoverable() {
+    return workflows.values().stream()
+        .filter(workflow -> workflow.status() == WorkflowStatus.PENDING
+            || workflow.status() == WorkflowStatus.RUNNING)
+        .toList();
+  }
+
+  @Override
   public synchronized List<Workflow> incomplete(int limit) {
     List<Workflow> result = new ArrayList<>();
     for (Workflow workflow : workflows.values()) {

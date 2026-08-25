@@ -9,6 +9,9 @@ import java.util.Optional;
 public interface JobQueue {
   void enqueue(JobRecord job);
 
+  /** Replaces stale non-terminal queue state during process-start recovery. */
+  void requeue(JobRecord job);
+
   Optional<JobRecord> claim(JobRecord.JobType type, String owner, Duration lease, Instant now);
 
   boolean complete(String jobId, String owner);

@@ -4,6 +4,7 @@ import dev.notify.artifact.job.Job;
 import dev.notify.artifact.model.JobRecord;
 import dev.notify.artifact.queue.QueueManager;
 import dev.notify.artifact.retry.RetryPolicy;
+import dev.notify.artifact.store.JobStore;
 
 import java.time.Duration;
 import java.time.Instant;
@@ -39,6 +40,7 @@ public final class Worker implements AutoCloseable {
   private final Duration idlePollInterval;
   private final Consumer<JobFailure> failureHandler;
   private final JobRecordExecutor jobExecutor;
+  private final JobStore jobStore;
   private final AtomicBoolean running = new AtomicBoolean();
   private final AtomicBoolean batchRunning = new AtomicBoolean();
   private final ExecutorService jobExecutorService;
@@ -62,7 +64,7 @@ public final class Worker implements AutoCloseable {
     this(
         id, batchSize, batchBytes, type, queueManager, retryPolicy, leaseDuration,
         idlePollInterval, flushInterval, failureHandler,
-        ignored -> () -> null);
+        ignored -> () -> null, null);
   }
 
   public Worker(
@@ -77,6 +79,24 @@ public final class Worker implements AutoCloseable {
       Duration flushInterval,
       Consumer<JobFailure> failureHandler,
       JobRecordExecutor jobExecutor) {
+    this(
+        id, batchSize, batchBytes, type, queueManager, retryPolicy, leaseDuration,
+        idlePollInterval, flushInterval, failureHandler, jobExecutor, null);
+  }
+
+  public Worker(
+      String id,
+      int batchSize,
+      long batchBytes,
+      JobRecord.JobType type,
+      QueueManager queueManager,
+      RetryPolicy retryPolicy,
+      Duration leaseDuration,
+      Duration idlePollInterval,
+      Duration flushInterval,
+      Consumer<JobFailure> failureHandler,
+      JobRecordExecutor jobExecutor,
+      JobStore jobStore) {
     this.id = id;
     this.buffer = new Buffer<>(batchSize, batchBytes, flushInterval);
     this.type = type;
@@ -86,6 +106,7 @@ public final class Worker implements AutoCloseable {
     this.idlePollInterval = Objects.requireNonNull(idlePollInterval, "idlePollInterval");
     this.failureHandler = Objects.requireNonNull(failureHandler, "failureHandler");
     this.jobExecutor = Objects.requireNonNull(jobExecutor, "jobExecutor");
+    this.jobStore = jobStore;
     if (leaseDuration.isZero() || leaseDuration.isNegative()) {
       throw new IllegalArgumentException("leaseDuration must be positive");
     }
@@ -129,6 +150,7 @@ public final class Worker implements AutoCloseable {
           Thread.sleep(idlePollInterval.toMillis());
           continue;
         }
+        saveClaimed(claimed.get());
         LOGGER.log(
             System.Logger.Level.DEBUG,
             "worker={0} event=claimed job={1} type={2} attempt={3}",
@@ -143,7 +165,7 @@ public final class Worker implements AutoCloseable {
                     new StateChange(id, claimed.get().id(), claimed.get().type(), transition)));
         stateMachines.put(claimed.get().id(), stateMachine);
         addToBuffer(claimed.get(), stateMachine);
-        if (buffer.shouldFlush()) {
+        if (buffer.shouldFlush() && !batchRunning.get()) {
           execute(buffer.drain());
         }
       } catch (InterruptedException interrupted) {
@@ -184,12 +206,6 @@ public final class Worker implements AutoCloseable {
         new BufferedJob(record, jobExecutor.toJob(record), stateMachine, new AtomicBoolean());
     if (!buffer.add(bufferedJob, 1)) {
       execute(buffer.drain());
-      if (!buffer.add(bufferedJob, 1)) {
-        failureHandler.accept(
-            new JobFailure(
-                bufferedJob.job(),
-                new IllegalStateException("Job exceeds worker buffer capacity")));
-      }
     }
   }
 
@@ -217,6 +233,7 @@ public final class Worker implements AutoCloseable {
     try {
       stateMachine.transition(JobStateMachines.State.VALIDATING, "job claimed");
       if (leaseExpired(record, Instant.now())) {
+        updateJob(record, JobRecord.JobStatus.DEAD_LETTER, record.nextAttemptAt(), "Lease expired", false);
         stateMachine.transition(JobStateMachines.State.CANCELLED, "job lease expired");
         LOGGER.log(
             System.Logger.Level.WARNING,
@@ -227,6 +244,7 @@ public final class Worker implements AutoCloseable {
       }
       validate(record);
       stateMachine.transition(JobStateMachines.State.BUFFERED, "job validated");
+      updateJob(record, JobRecord.JobStatus.RUNNING, record.nextAttemptAt(), null, true);
       stateMachine.transition(JobStateMachines.State.RUNNING, "job execution started");
       LOGGER.log(
           System.Logger.Level.INFO,
@@ -244,6 +262,7 @@ public final class Worker implements AutoCloseable {
                 bufferedJob.job(),
                 new IllegalStateException("Completion rejected for job " + record.id())));
       } else {
+        updateJob(record, JobRecord.JobStatus.COMPLETED, null, null, false);
         stateMachine.transition(JobStateMachines.State.COMPLETED, "job completed");
         LOGGER.log(
             System.Logger.Level.INFO,
@@ -313,8 +332,11 @@ public final class Worker implements AutoCloseable {
     JobRecord record = bufferedJob.record();
     failureHandler.accept(new JobFailure(bufferedJob.job(), failure));
     if (record.attempts() >= retryPolicy.maxAttempts()) {
-      queueManager.deadLetter(type, record.id(), owner, safeMessage(failure));
-      stateMachine.transition(JobStateMachines.State.DEAD_LETTER, safeMessage(failure));
+      String error = safeMessage(failure);
+      if (queueManager.deadLetter(type, record.id(), owner, error)) {
+        updateJob(record, JobRecord.JobStatus.DEAD_LETTER, null, error, false);
+      }
+      stateMachine.transition(JobStateMachines.State.DEAD_LETTER, error);
       LOGGER.log(
           System.Logger.Level.ERROR,
           "worker={0} event=dead_lettered job={1} error={2}",
@@ -323,8 +345,11 @@ public final class Worker implements AutoCloseable {
           safeMessage(failure));
     } else {
       Instant retryAt = Instant.now().plus(retryPolicy.delay(record.attempts()));
-      queueManager.retry(type, record.id(), owner, retryAt, safeMessage(failure));
-      stateMachine.transition(JobStateMachines.State.RETRY_PENDING, safeMessage(failure));
+      String error = safeMessage(failure);
+      if (queueManager.retry(type, record.id(), owner, retryAt, error)) {
+        updateJob(record, JobRecord.JobStatus.RETRY_PENDING, retryAt, error, false);
+      }
+      stateMachine.transition(JobStateMachines.State.RETRY_PENDING, error);
       LOGGER.log(
           System.Logger.Level.WARNING,
           "worker={0} event=retry_scheduled job={1} retryAt={2} error={3}",
@@ -333,6 +358,30 @@ public final class Worker implements AutoCloseable {
           retryAt,
           safeMessage(failure));
     }
+  }
+
+  private void saveClaimed(JobRecord claimed) {
+    if (jobStore != null) {
+      jobStore.save(claimed);
+    }
+  }
+
+  private void updateJob(
+      JobRecord record,
+      JobRecord.JobStatus status,
+      Instant nextAttemptAt,
+      String lastError,
+      boolean retainLease) {
+    if (jobStore == null) return;
+    jobStore.update(
+        record.id(),
+        current ->
+            new JobRecord(
+                current.id(), current.tenantId(), current.artifactId(), current.type(), status,
+                record.attempts(), nextAttemptAt,
+                retainLease ? record.leaseOwner() : null,
+                retainLease ? record.leaseExpiresAt() : null,
+                current.attributes(), lastError, current.createdAt(), Instant.now()));
   }
 
   private static boolean leaseExpired(JobRecord record, Instant now) {

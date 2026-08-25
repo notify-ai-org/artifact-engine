@@ -8,6 +8,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import dev.notify.artifact.dispatcher.QueuingJobDispatcher;
 import dev.notify.artifact.model.JobRecord;
 import dev.notify.artifact.queue.QueueManager;
+import dev.notify.artifact.store.InMemoryJobStore;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Map;
@@ -15,6 +16,22 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import org.junit.jupiter.api.Test;
 
 class QueuingJobDispatcherTest {
+  @Test
+  void storesDurableRecordBeforeEnqueueing() throws Exception {
+    JobRecord record =
+        JobRecord.pending(
+            "stored-operation", "tenant-a", "artifact-a", JobRecord.JobType.INDEX, Map.of());
+    InMemoryJobStore jobs = new InMemoryJobStore();
+
+    try (QueueManager queueManager = new QueueManager()) {
+      QueuingJobDispatcher dispatcher = new QueuingJobDispatcher(queueManager, jobs);
+
+      dispatcher.dispatch(queueable(record, "accepted", new AtomicBoolean()));
+
+      assertEquals(record, jobs.find(record.id()).orElseThrow());
+    }
+  }
+
   @Test
   void enqueuesDurableRecordWithoutExecutingProcessLocalJob() throws Exception {
     AtomicBoolean executed = new AtomicBoolean();
