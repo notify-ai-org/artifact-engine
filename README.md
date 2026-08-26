@@ -1,251 +1,183 @@
 # Artifact Engine
 
-`artifact-engine` is a Java 17 library for durable artifact intake, asynchronous storage and RAG
-indexing, tenant-scoped retrieval, and Model Context Protocol exposure. The core remains independent
-of any S3 SDK, vector database, OCR engine, or embedding vendor.
+`artifact-engine` is a Java 17 library for durable, tenant-scoped artifact ingestion and retrieval.
+It safely spools uploaded bytes, stores originals in S3, extracts and embeds text, performs hybrid
+RAG search, and exposes metadata and content through a read-only Model Context Protocol (MCP)
+server.
 
-## Intake and recovery flow
+The core uses interfaces for metadata, objects, vectors, queues, authentication, and embeddings.
+Production adapters are included for PostgreSQL/pgvector, S3, Redis, and OpenAI-compatible embedding
+endpoints; in-memory adapters support tests and local development.
 
-```text
-API / MCP request
-   │
-   ▼
-ArtifactEngine ── create typed Job ── JobDispatcher
-                                      │
-                                      ▼
-                                  IngestJob
-                                      │ bounded 64 KiB copies, quota checks, SHA-256
-                                      ▼
-DurableSpool ── atomic content + metadata publication
-   │
-   ▼
-MetadataStore.register(artifact, STORE + INDEX operations)
-   │ single transaction
-   ▼
-Transactional outbox ── QueueManager ── RedisJobQueue
-                                          │ leased claims + heartbeat
-                         ┌────────────────┴───────────────┐
-                         ▼                                ▼
-                     StoreJob                         IndexJob
-                  put + verification        extract/OCR → chunk → embed
-                         │                                │
-                         ▼                                ▼
-                    ObjectStore                       VectorStore
-```
+Ingestion authorizes the principal, copies input to a bounded durable spool, detects the media type,
+sanitizes the filename, calculates a SHA-256 checksum, and registers metadata. Storage and indexing
+are restart-safe jobs with stable operation, object, chunk, and vector identities. Optional
+workflows persist ordered job steps and resume incomplete work after a restart.
 
-An accepted artifact is recoverable from the spool before object storage is contacted. Stable
-operation ids, object keys, chunk ids, and vector identities make every asynchronous step safe to
-repeat. Queue completion and retry transitions succeed only for the current, unexpired lease owner.
+## Public API
 
-## Important invariants
+The `ArtifactEngine` facade provides:
 
-- Tenant id is mandatory at every store boundary and comes from the authenticated MCP session.
-- User filenames never become filesystem paths or object-key segments.
-- MIME type is detected from content; PNG, JPEG, WebP, PDF, DOCX, UTF-8 text, Markdown, and HTML are
-  supported.
-- Idempotency keys are compared with a fingerprint of tenant, checksum, media type, name, and intake
-  metadata. Reuse with different content raises `IdempotencyConflictException`.
-- Artifact creation and initial `STORE`/`INDEX` operations share a transactional-outbox commit.
-- Storage and indexing state updates are atomic and cannot overwrite each other's concurrent state.
-- Search performs keyword and vector candidate retrieval, reciprocal-rank fusion, metadata filters,
-  and a final result cap.
-- MCP tool inputs contain no caller-controlled tenant id; extracted text is marked as untrusted and
-  binary responses are capped before Base64 materialization.
-- Delete tombstones metadata first, blocks subsequent reads, then idempotently removes vectors,
+- `ingest` to accept and spool an artifact;
+- `metadata` and `listMetadata` to inspect tenant-owned artifacts;
+- `content` to stream original bytes;
+- `extractedText` to return bounded extracted text;
+- `search` to perform filtered hybrid retrieval; and
+- `delete` to tombstone metadata and remove stored content and vectors.
+
+Every request carries a trusted principal ID and tenant ID. Applications normally construct a
+`DefaultArtifactJobFactory`, select direct and queued dispatchers, and pass both to
+`DefaultArtifactEngine`. `EngineOptions` controls content deduplication and the retrieval candidate
+multiplier.
+
+## Processing guarantees
+
+- Tenant identity is required at every storage and retrieval boundary.
+- User filenames never become filesystem paths or S3 key segments.
+- Content type is detected from uploaded bytes rather than trusted request metadata.
+- Idempotency keys are bound to a fingerprint of tenant, checksum, media type, filename, and intake
+  metadata. Reusing a key for different content raises `IdempotencyConflictException`.
+- The spool publishes content and metadata atomically and enforces a maximum artifact size.
+- Queue claims are leased; completion, retry, heartbeat, and dead-letter transitions require the
+  current lease owner.
+- Storage and indexing update independent artifact states and use optimistic versions.
+- Search combines keyword and vector candidates with reciprocal-rank fusion, tenant-scoped filters,
+  and a final result limit.
+- HTML becomes inert plain text. MCP responses identify extracted text as untrusted and bound text
+  and binary response sizes.
+- Deletion tombstones metadata first, blocks later reads, and then idempotently removes vectors,
   object content, and spool content.
 
-## Packages
+## Main packages
 
-- `spool`: durable publication, global/per-tenant quotas, accounting rebuild, and reconciliation.
-- `store`: metadata/outbox, object, vector, and audit contracts plus development adapters.
-- `spring.jpa`: JPA metadata, transactional-outbox, and append-only audit adapters.
-- `store.s3`: exact-length S3 streaming with tenant-key, checksum, owner, and SSE-KMS checks.
-- `store.postgres`: tenant-scoped pgvector upserts, cosine search, and PostgreSQL full-text search.
-- `queue`: in-memory and Redis leased queues plus transactional-outbox dispatch.
-- `worker`: bounded local workers, durable queue workers, lease heartbeat, state machines, snapshots.
-- `job`: all intake, metadata, fetch, text, search, delete, storage, and indexing workflows plus
-  typed factory/dispatcher boundaries.
-- `connector`: connector lifecycle, pooling, filesystem input, and SDK-neutral S3 output.
-- `embed` / `extract`: batched embeddings, bounded LRU cache, native extraction, and OCR contracts.
-- `auth`: authorization contract and content-based data verification.
-- `mcp`: typed gateway plus a Java MCP SDK 2.x stdio server, tools, and resource templates.
-- `spring`: overridable Spring bean configuration and spool policy defaults.
+- `job`, `factory`, and `dispatcher`: typed operations and direct/queued execution routing.
+- `spool`: durable intake publication and recovery.
+- `queue` and `worker`: in-memory or Redis queues, leased claims, batching, retries, and snapshots.
+- `workflow`: persisted ordered job workflows and restart recovery.
+- `store`: metadata, object, vector, job, and log contracts plus development adapters.
+- `jdbc`: Jdbi PostgreSQL metadata, vector, job, and workflow stores.
+- `extract` and `embed`: PDF, DOCX, HTML, Markdown, text, OCR, batching, and embedding cache support.
+- `auth` and `security`: authorization, content verification, and tenant-safe storage identities.
+- `mcp`: the tenant-bound gateway and Java MCP SDK stdio server.
+- `environment`: command-line, environment-variable, and properties-file configuration resolution.
 
-## Authentication and verification
+## Production storage
 
-`ArtifactAccessVerifier` is the single security boundary used by artifact jobs. It:
+The standalone provider uses PostgreSQL through HikariCP and Jdbi when a JDBC URL is set, and
+process-local metadata and vector stores otherwise. Original content uses S3 with SSE-KMS, intake
+uses a durable local spool, and embeddings use an OpenAI-compatible HTTP endpoint.
 
-1. requires non-empty trusted principal and tenant identifiers;
-2. delegates permission checks to `AuthorizationService`;
-3. verifies uploaded bytes against the declared media type with `DataVerifier`;
-4. normalizes untrusted filenames;
-5. verifies that loaded artifacts belong to the requested tenant; and
-6. converts extracted HTML to inert plain text before indexing or returning it.
+S3 writes stream from the spool with an exact content length. Reads and writes validate the
+environment-specific hashed tenant prefix, tenant metadata, byte length, SHA-256, expected bucket
+owner (when configured), and SSE-KMS settings.
 
-Spring requires the normal `AuthorizationService` and `DataVerifier` beans and wires this layer
-directly into the job factory. There is no configurable or bypassable filter chain.
+Apply the PostgreSQL migrations in order before starting a JDBC-backed deployment:
 
-## Infrastructure adapters
-
-The module includes JPA metadata, transactional-outbox, and append-only audit stores; an atomic
-Redis queue; an AWS SDK v2 S3 object store; and a PostgreSQL/pgvector vector store. Applications
-still supply their configured `DataSource`, `S3Client`, `EmbeddingProvider`, document extractors/OCR,
-and `AuthorizationService`.
-
-`DefaultArtifactEngine` is intentionally a thin facade: each API method asks `ArtifactJobFactory`
-for one typed job and passes it to `JobDispatcher`. Authorization, security filtering, spooling,
-metadata transitions, retrieval fusion, downloads, and deletion all execute inside job
-implementations. Spring supplies `DirectJobDispatcher` for synchronous calls; applications may
-replace the `JobDispatcher` bean with `QueuingJobDispatcher`. Jobs implementing `QueueableJob`
-provide a restart-safe `JobRecord`; the dispatcher passes that record to the queue owned by
-`QueueManager` and returns the job's enqueue acknowledgement without executing the workflow.
-Non-queueable request/response jobs use the configured inline dispatcher. Durable workers rebuild
-`StoreJob` or `IndexJob` from the claimed record instead of deserializing process-local Java jobs.
-
-The S3 and PostgreSQL adapters are opt-in Spring beans:
-
-```properties
-artifact.jpa.enabled=true
-
-artifact.s3.enabled=true
-artifact.s3.bucket=private-artifacts
-artifact.s3.environment=production
-artifact.s3.kms-key-id=alias/artifact-engine
-# artifact.s3.expected-bucket-owner=123456789012
-# artifact.s3.bucket-key-enabled=true
-
-artifact.vector.postgres.enabled=true
-artifact.vector.postgres.dimensions=1536
+```text
+src/main/resources/db/migration/V1__artifact_engine.sql
+src/main/resources/db/migration/V2__artifact_workflow.sql
+src/main/resources/db/migration/V3__artifact_workflow_step_details.sql
+src/main/resources/db/migration/V4__normalize_workflow_records.sql
 ```
 
-Import `ArtifactProductionStoreConfiguration` to register these opt-in adapters. Enabling JPA also
-registers the library entities and Spring Data repositories explicitly, so the application does not
-need to widen its component-scan package.
+`V1` installs the `vector` extension and declares `vector(1536)`. If a different embedding size is
+used, update the migration and `ARTIFACT_VECTOR_DIMENSIONS` together. Run extension creation with a
+suitably privileged migration role.
 
-Amazon Textract OCR can be enabled for supported image uploads with:
+## Standalone MCP server
 
-```properties
-artifact.ocr.textract.enabled=true
-artifact.ocr.textract.max-input-bytes=10485760
-artifact.ocr.max-output-characters=1000000
-```
-
-The default `TextractClient` uses the AWS SDK region and credentials provider chains. Applications
-can instead provide their own `TextractClient` bean. OCR input and output are bounded locally before
-and after the synchronous `DetectDocumentText` request.
-
-S3 uploads stream from the durable spool with an exact content length and never buffer an entire
-artifact. Every operation validates the environment and hashed-tenant key prefix. Upload and read
-verification require SSE-KMS, tenant metadata, length, and SHA-256 checksums.
-
-Vector identities are unique across tenant, artifact, chunk index, embedding model, and embedding
-version. Reprocessing therefore updates one row rather than creating duplicate vectors. Search SQL
-binds the authenticated tenant before applying media/tag filters and only returns artifacts whose
-index state is `READY`.
-
-## MCP stdio server
-
-`ArtifactMcpStdioServer` exposes the native facade through the official Java MCP SDK. It provides
-the following read-only tools:
+`ArtifactMcpStdioServer` exposes four read-only tools:
 
 - `artifact_search`
 - `artifact_metadata`
 - `artifact_text`
 - `artifact_read_content`
 
-It also publishes `artifact://{artifactId}/metadata`, `/text`, and `/content` resource templates.
-Original bytes are returned in bounded Base64 segments with `nextOffset` and `endOfFile`; the hard
-library ceiling is 4 MiB per segment. Search excerpts are capped independently, and extracted text
-has a 1,000,000-character absolute ceiling.
-
-Each stdio process is bound at startup to one authenticated principal, tenant, and scope set. Tool
-schemas intentionally do not accept those fields. The launcher reserves stdout solely for MCP
-JSON-RPC and redirects ordinary `System.out` output to stderr.
-
-The reusable server can be constructed directly with an `ArtifactEngine`. To use the standalone
-`ArtifactMcpStdioMain`, the module registers a default
-`dev.notify.artifact.mcp.stdio.ArtifactMcpEngineProvider` in:
+It also publishes:
 
 ```text
-META-INF/services/dev.notify.artifact.mcp.stdio.ArtifactMcpEngineProvider
+artifact://{artifactId}/metadata
+artifact://{artifactId}/text
+artifact://{artifactId}/content
 ```
 
-The ACP client supplies these process-bound environment values automatically:
+Each stdio process is bound to one principal, tenant, and scope set. Those trusted fields are not
+accepted in tool inputs. Original content is returned as bounded Base64 chunks with `nextOffset`
+and `endOfFile`; the library enforces a 4 MiB hard ceiling per chunk. Standard output is reserved
+for MCP JSON-RPC and ordinary process output is redirected to standard error.
+
+The launcher resolves configuration, in descending precedence, from command-line arguments, OS
+environment variables, and `src/main/resources/artifact-mcp.properties`. Arguments support both
+`--KEY=value` and `--KEY value`:
+
+```bash
+java -jar artifact-engine.jar \
+  --ARTIFACT_MCP_PRINCIPAL_ID=principal-a \
+  --ARTIFACT_MCP_TENANT_ID=tenant-a \
+  --ARTIFACT_MCP_SCOPES=artifact.search,artifact.metadata,artifact.text,artifact.content
+```
+
+### Configuration
+
+Identity and response limits:
 
 ```text
 ARTIFACT_MCP_PRINCIPAL_ID
 ARTIFACT_MCP_TENANT_ID
 ARTIFACT_MCP_SCOPES
+ARTIFACT_MCP_MAX_TEXT_CHARACTERS
+ARTIFACT_MCP_MAX_CONTENT_BYTES
+ARTIFACT_MCP_REQUEST_TIMEOUT_SECONDS
 ```
 
-The launcher resolves configuration, in descending precedence, from command-line options, OS
-environment variables, and `src/main/resources/artifact-mcp.properties`. Command-line options may
-use either `--KEY=value` or `--KEY value` syntax. For example:
-
-```bash
-java -jar artifact-engine.jar --ARTIFACT_MCP_TENANT_ID=tenant-a \
-  --ARTIFACT_MCP_PRINCIPAL_ID principal-a \
-  --ARTIFACT_MCP_SCOPES artifact.search,artifact.metadata
-```
-
-The default S3 store requires `ARTIFACT_S3_BUCKET` and `ARTIFACT_S3_KMS_KEY_ID`. Optional S3 keys
-are `ARTIFACT_S3_REGION`, `ARTIFACT_S3_ENVIRONMENT`,
-`ARTIFACT_S3_EXPECTED_BUCKET_OWNER`, and `ARTIFACT_S3_BUCKET_KEY_ENABLED`.
-
-The default provider uses Jdbi and HikariCP for PostgreSQL metadata and vector stores when either
-`ARTIFACT_JDBC_URL` or `JDBC_DATABASE_URL` is set. Otherwise, it starts with process-local stores.
-The JDBC configuration is:
+PostgreSQL and pgvector:
 
 ```text
-ARTIFACT_JDBC_URL=jdbc:postgresql://127.0.0.1:5432/notify_db
-ARTIFACT_JDBC_USER=notification_user
-ARTIFACT_JDBC_PASSWORD=...
-ARTIFACT_JDBC_MAX_POOL_SIZE=8
-ARTIFACT_JDBC_MIN_IDLE=1
-ARTIFACT_VECTOR_DIMENSIONS=1536
+ARTIFACT_JDBC_URL                 # JDBC_DATABASE_URL fallback
+ARTIFACT_JDBC_USER                # DB_USER fallback
+ARTIFACT_JDBC_PASSWORD            # DB_PASSWORD fallback
+ARTIFACT_JDBC_MAX_POOL_SIZE       # default: 8
+ARTIFACT_JDBC_MIN_IDLE            # default: 1
+ARTIFACT_VECTOR_DIMENSIONS        # default: 1536
 ```
 
-`DB_USER` and `DB_PASSWORD` are accepted as credential fallbacks. Apply
-`db/migration/V1__artifact_engine.sql` before starting the JDBC-backed provider. The configured
-vector dimensions must match the migration's `vector(N)` declaration.
-
-Embeddings use an OpenAI-compatible HTTP endpoint through a shared OkHttp client:
+S3 and the local spool:
 
 ```text
-EMBEDDING_BASE_URL=https://api.openai.com/v1
-EMBEDDING_API_PATH=/embeddings
-EMBEDDING_API_KEY=...
-EMBEDDING_QUERY_MODEL=text-embedding-3-small
-EMBEDDING_MODELS=text-embedding-3-small,text-embedding-3-large
-EMBEDDING_MODEL_VERSION=text-embedding-3-small
-EMBEDDING_MAX_BATCH_SIZE=32
-EMBEDDING_MAX_WAIT_MILLIS=25
-EMBEDDING_CACHE_MAX_ENTRIES=10000
-EMBEDDING_CACHE_TTL_SECONDS=3600
-EMBEDDING_CONNECT_TIMEOUT_SECONDS=10
-EMBEDDING_TIMEOUT_SECONDS=30
+ARTIFACT_S3_BUCKET                # required
+ARTIFACT_S3_KMS_KEY_ID            # required
+ARTIFACT_S3_REGION                # default: ap-south-1
+ARTIFACT_S3_ENVIRONMENT           # default: default
+ARTIFACT_S3_EXPECTED_BUCKET_OWNER # optional
+ARTIFACT_S3_BUCKET_KEY_ENABLED    # default: true
+ARTIFACT_SPOOL_ROOT               # default: ./data/artifact-spool
+ARTIFACT_SPOOL_MAX_ARTIFACT_BYTES # default: 134217728
 ```
 
-`OPENAI_API_KEY` is accepted as the API-key fallback. The returned vector size is validated against
-`ARTIFACT_VECTOR_DIMENSIONS` before vectors reach the store.
-`EMBEDDING_QUERY_MODEL` is the default model; additional comma-separated `EMBEDDING_MODELS` can be
-selected through `EmbeddingService.embed(model, texts)`. Concurrent misses for the same model are
-coalesced until the batch is full or `EMBEDDING_MAX_WAIT_MILLIS` elapses. Provider failures use the
-artifact retry policy, and successful vectors expire from the local cache after the configured TTL.
+Embeddings:
 
-Optional safe response controls are `ARTIFACT_MCP_MAX_TEXT_CHARACTERS`,
-`ARTIFACT_MCP_MAX_CONTENT_BYTES`, and `ARTIFACT_MCP_REQUEST_TIMEOUT_SECONDS`. The deployment provider
-is responsible for constructing the same production stores, workers, and authorization service used
-by the native facade. Do not write logs to the preserved protocol output stream.
+```text
+EMBEDDING_BASE_URL                # default: https://api.openai.com/v1
+EMBEDDING_API_PATH                # default: /embeddings
+EMBEDDING_API_KEY                 # OPENAI_API_KEY fallback
+EMBEDDING_QUERY_MODEL             # default: text-embedding-3-small
+EMBEDDING_MODELS                  # optional comma-separated models
+EMBEDDING_MODEL_VERSION
+EMBEDDING_MAX_BATCH_SIZE          # default: 32
+EMBEDDING_MAX_WAIT_MILLIS         # default: 25
+EMBEDDING_CACHE_MAX_ENTRIES       # default: 10000
+EMBEDDING_CACHE_TTL_SECONDS       # default: 3600
+EMBEDDING_CONNECT_TIMEOUT_SECONDS # default: 10
+EMBEDDING_TIMEOUT_SECONDS         # default: 30
+```
 
-Production schema bootstrap is available at
-`src/main/resources/db/migration/V1__artifact_engine.sql`. It targets PostgreSQL, installs the
-`vector` extension, and declares `vector(1536)`. If the embedding model has another supported
-dimension, change both the migration column and `artifact.vector.postgres.dimensions` before
-deployment. Run extension creation with a suitably privileged migration role, configure a private
-versioned S3 bucket, and keep the spool on durable local storage with sufficient per-tenant quota.
+Embedding requests sharing a model are coalesced until the batch is full or the maximum wait
+elapses. Successful vectors are cached with a bounded TTL, provider failures use the artifact retry
+policy, and returned vector dimensions are checked before storage.
 
-## Build
+## Build and test
+
+From the repository root:
 
 ```bash
 mvn -pl artifact-engine -am test
