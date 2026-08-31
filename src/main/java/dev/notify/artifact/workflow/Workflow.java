@@ -19,4 +19,12 @@ public record Workflow(
     workflowSteps = List.copyOf(workflowSteps);
     attributes = Map.copyOf(attributes);
   }
+
+  public enum WorkflowStatus {
+  PENDING,
+  RUNNING,
+  COMPLETED,
+  CRASHED
+}
+
 }

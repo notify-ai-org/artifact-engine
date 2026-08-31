@@ -19,7 +19,17 @@ public record WorkflowStep(
     int sequence,
     Map<String, String> attributes,
     String failureMessage) {
+      
   public WorkflowStep {
     attributes = Map.copyOf(attributes);
   }
+
+  public enum WorkflowStepStatus {
+    PENDING,
+    SUBMITTED,
+    RUNNING,
+    COMPLETED,
+    CRASHED
+  }
+
 }

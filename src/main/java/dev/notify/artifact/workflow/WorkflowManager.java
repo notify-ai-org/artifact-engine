@@ -5,6 +5,9 @@ import dev.notify.artifact.queue.QueueManager;
 import dev.notify.artifact.worker.JobStateMachines;
 import dev.notify.artifact.worker.Worker;
 import dev.notify.artifact.worker.WorkerManager;
+import dev.notify.artifact.workflow.Workflow.WorkflowStatus;
+import dev.notify.artifact.workflow.WorkflowStep.WorkflowStepStatus;
+
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;

@@ -7,6 +7,8 @@ import java.util.NoSuchElementException;
 import java.util.Optional;
 import java.util.function.UnaryOperator;
 
+import dev.notify.artifact.workflow.Workflow.WorkflowStatus;
+
 public final class InMemoryWorkflowStore implements WorkflowStore {
   private final java.util.Map<String, Workflow> workflows = new LinkedHashMap<>();
 
