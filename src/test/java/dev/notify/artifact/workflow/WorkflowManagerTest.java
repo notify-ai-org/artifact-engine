@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import dev.notify.artifact.model.JobRecord;
 import dev.notify.artifact.queue.QueueManager;
+import dev.notify.artifact.workflow.Workflow.WorkflowStatus;
 import dev.notify.artifact.worker.JobStateMachines;
 import dev.notify.artifact.worker.StateMachine;
 import dev.notify.artifact.worker.Worker;
