@@ -23,8 +23,7 @@ class ArtifactMcpServerFeaturesTest {
     ArtifactMcpServerFeatures features = features(engine);
 
     for (SyncToolSpecification specification : features.tools()) {
-      Map<String, Object> properties =
-          (Map<String, Object>) specification.tool().inputSchema().get("properties");
+      Map<String, Object> properties = specification.tool().inputSchema().properties();
       assertFalse(properties.containsKey("tenantId"), specification.tool().name());
       assertFalse(properties.containsKey("principalId"), specification.tool().name());
     }

@@ -49,7 +49,8 @@ class ArtifactMcpStdioIntegrationTest {
 
       CallToolResult result =
           client.callTool(
-              CallToolRequest.builder(ArtifactMcpServerFeatures.METADATA_TOOL)
+              CallToolRequest.builder()
+                  .name(ArtifactMcpServerFeatures.METADATA_TOOL)
                   .arguments(Map.of("artifactId", "artifact-1"))
                   .build());
 
@@ -59,7 +60,8 @@ class ArtifactMcpStdioIntegrationTest {
 
       CallToolResult content =
           client.callTool(
-              CallToolRequest.builder(ArtifactMcpServerFeatures.CONTENT_TOOL)
+              CallToolRequest.builder()
+                  .name(ArtifactMcpServerFeatures.CONTENT_TOOL)
                   .arguments(
                       Map.of("artifactId", "artifact-1", "offset", 0, "maxBytes", 4))
                   .build());

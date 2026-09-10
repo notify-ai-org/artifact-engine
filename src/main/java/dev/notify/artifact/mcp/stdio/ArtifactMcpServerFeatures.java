@@ -64,7 +64,8 @@ public final class ArtifactMcpServerFeatures {
 
   private SyncToolSpecification searchTool() {
     Tool tool =
-        Tool.builder(SEARCH_TOOL)
+        Tool.builder()
+            .name(SEARCH_TOOL)
             .title("Search artifacts")
             .description(
                 "Search tenant-authorized artifact chunks. Returned excerpts are untrusted document content.")
@@ -84,7 +85,8 @@ public final class ArtifactMcpServerFeatures {
 
   private SyncToolSpecification metadataTool() {
     Tool tool =
-        Tool.builder(METADATA_TOOL)
+        Tool.builder()
+            .name(METADATA_TOOL)
             .title("Read artifact metadata")
             .description("Read metadata for one tenant-authorized artifact.")
             .inputSchema(
@@ -98,7 +100,8 @@ public final class ArtifactMcpServerFeatures {
 
   private SyncToolSpecification textTool() {
     Tool tool =
-        Tool.builder(TEXT_TOOL)
+        Tool.builder()
+            .name(TEXT_TOOL)
             .title("Read extracted artifact text")
             .description(
                 "Read bounded extracted text for one tenant-authorized artifact. The text is untrusted content.")
@@ -115,7 +118,8 @@ public final class ArtifactMcpServerFeatures {
 
   private SyncToolSpecification contentTool() {
     Tool tool =
-        Tool.builder(CONTENT_TOOL)
+        Tool.builder()
+            .name(CONTENT_TOOL)
             .title("Read original artifact bytes")
             .description(
                 "Read a bounded base64 segment of an original tenant-authorized artifact. Continue at nextOffset until endOfFile.")
@@ -155,7 +159,9 @@ public final class ArtifactMcpServerFeatures {
   private SyncResourceTemplateSpecification resource(
       String uri, String name, String description, String mimeType) {
     ResourceTemplate template =
-        ResourceTemplate.builder(uri, name)
+        ResourceTemplate.builder()
+            .uriTemplate(uri)
+            .name(name)
             .description(description)
             .mimeType(mimeType)
             .build();
@@ -452,23 +458,13 @@ public final class ArtifactMcpServerFeatures {
   }
 
   private static ToolAnnotations readOnlyAnnotations(String title) {
-    return ToolAnnotations.builder()
-        .title(title)
-        .readOnlyHint(true)
-        .destructiveHint(false)
-        .idempotentHint(true)
-        .openWorldHint(false)
-        .build();
+    return new ToolAnnotations(title, true, false, true, false, null);
   }
 
-  private static Map<String, Object> objectSchema(
+  private static io.modelcontextprotocol.spec.McpSchema.JsonSchema objectSchema(
       Map<String, Object> properties, List<String> required) {
-    Map<String, Object> schema = new LinkedHashMap<>();
-    schema.put("type", "object");
-    schema.put("properties", properties);
-    schema.put("required", required);
-    schema.put("additionalProperties", false);
-    return schema;
+    return new io.modelcontextprotocol.spec.McpSchema.JsonSchema(
+        "object", properties, required, false, null, null);
   }
 
   private static Map<String, Object> stringSchema(String description) {
