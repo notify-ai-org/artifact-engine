@@ -8,6 +8,7 @@ import dev.notify.artifact.DefaultArtifactEngine;
 import dev.notify.artifact.EngineOptions;
 import dev.notify.artifact.auth.DataVerifier;
 import dev.notify.artifact.auth.DefaultAuthorizationService;
+import dev.notify.artifact.auth.AuthorizationService.Permission;
 import dev.notify.artifact.dispatcher.JobDispatcher;
 import dev.notify.artifact.dispatcher.QueuingJobDispatcher;
 import dev.notify.artifact.dispatcher.RoutingJobDispatcher;
@@ -34,6 +35,8 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import okhttp3.HttpUrl;
 import okhttp3.OkHttpClient;
@@ -113,7 +116,7 @@ public final class DefaultArtifactMcpEngineProvider implements ArtifactMcpEngine
             spool,
             new DataVerifier(),
             embeddingRuntime.service(),
-            new DefaultAuthorizationService(),
+            authorizationService(environment),
             EngineOptions.defaults());
     directJobWorker = new dev.notify.artifact.worker.DirectJobWorker(4, 256);
     JobDispatcher directDispatcher =
@@ -160,6 +163,30 @@ public final class DefaultArtifactMcpEngineProvider implements ArtifactMcpEngine
     configuration.setMinimumIdle(positiveInt(environment, "ARTIFACT_JDBC_MIN_IDLE", 1));
     configuration.setPoolName("artifact-mcp-jdbc");
     return new HikariDataSource(configuration);
+  }
+
+  static DefaultAuthorizationService authorizationService(Environment environment) {
+    String principalId = required(environment, ArtifactMcpStdioMain.PRINCIPAL_ENV);
+    String tenantId = required(environment, ArtifactMcpStdioMain.TENANT_ENV);
+    Set<Permission> permissions = new LinkedHashSet<>();
+    for (String configuredScope : required(environment, ArtifactMcpStdioMain.SCOPES_ENV).split(",")) {
+      switch (configuredScope.trim()) {
+        case "artifact.search" -> permissions.add(Permission.SEARCH);
+        case "artifact.metadata" -> permissions.add(Permission.READ_METADATA);
+        case "artifact.text" -> permissions.add(Permission.READ_TEXT);
+        case "artifact.content" -> {
+          permissions.add(Permission.READ_METADATA);
+          permissions.add(Permission.DOWNLOAD);
+        }
+        case "artifact.*" -> permissions.addAll(
+            Set.of(Permission.SEARCH, Permission.READ_METADATA, Permission.READ_TEXT, Permission.DOWNLOAD));
+        default -> {
+          // Unsupported scopes remain ungranted.
+        }
+      }
+    }
+    return new DefaultAuthorizationService(
+        Map.of(new DefaultAuthorizationService.Subject(principalId, tenantId), permissions));
   }
 
   private static String property(Environment environment, String name) {

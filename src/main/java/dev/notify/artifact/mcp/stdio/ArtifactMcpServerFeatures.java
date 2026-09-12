@@ -276,7 +276,7 @@ public final class ArtifactMcpServerFeatures {
     } catch (IOException exception) {
       return error("CONTENT_UNAVAILABLE", "Artifact content is temporarily unavailable.");
     } catch (RuntimeException exception) {
-      return error("RETRIEVAL_FAILED", "The artifact operation could not be completed.");
+      return error("RETRIEVAL_FAILED", "The artifact operation could not be completed." + exception.getMessage());
     }
   }
 
@@ -303,7 +303,7 @@ public final class ArtifactMcpServerFeatures {
     } catch (IOException exception) {
       return error("CONTENT_UNAVAILABLE", "Artifact content is temporarily unavailable.");
     } catch (RuntimeException exception) {
-      return error("RETRIEVAL_FAILED", "The artifact operation could not be completed.");
+      return error("RETRIEVAL_FAILED", "The artifact operation could not be completed." + exception.getMessage());
     }
   }
 
