@@ -8,8 +8,11 @@ import dev.notify.artifact.store.MultipartUploadStore;
 import dev.notify.artifact.store.MultipartUploadStore.MultipartUpload;
 import dev.notify.artifact.store.ObjectStore;
 import dev.notify.artifact.util.Checksum;
+import dev.notify.artifact.util.StructuredLog;
 import java.io.IOException;
 import java.io.InputStream;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.Objects;
 
 /**
@@ -18,6 +21,8 @@ import java.util.Objects;
  * Re-uploading a part number replaces it, which makes retries safe.
  */
 public final class StorePartJob extends AbstractJob<ObjectStore.UploadedPart> {
+  private static final StructuredLog LOG = StructuredLog.of(StorePartJob.class);
+
   private final JobRecord record;
   private final ObjectStore objectStore;
   private final DurableSpool durableSpool;
@@ -48,14 +53,35 @@ public final class StorePartJob extends AbstractJob<ObjectStore.UploadedPart> {
     long offset = longAttribute(record, "offset");
     long length = longAttribute(record, "length");
 
-    String partSha256;
-    try (InputStream range = durableSpool.openRange(artifact.spoolPath(), offset, length)) {
-      partSha256 = Checksum.sha256(range);
-    }
-    try (InputStream range = durableSpool.openRange(artifact.spoolPath(), offset, length)) {
-      return objectStore.uploadPart(
-          record.tenantId(), upload.storageKey(), upload.uploadId(), partNumber, range, length,
-          partSha256);
+    Instant started = Instant.now();
+    LOG.debug("part_started", "artifact", record.artifactId(), "part", partNumber,
+        "of", upload.partCount(), "offset", offset, "bytes", length, "attempt", record.attempts(),
+        "priority", record.priority());
+    try {
+      String partSha256;
+      try (InputStream range = durableSpool.openRange(artifact.spoolPath(), offset, length)) {
+        partSha256 = Checksum.sha256(range);
+      }
+      Instant hashed = Instant.now();
+      ObjectStore.UploadedPart uploaded;
+      try (InputStream range = durableSpool.openRange(artifact.spoolPath(), offset, length)) {
+        uploaded = objectStore.uploadPart(
+            record.tenantId(), upload.storageKey(), upload.uploadId(), partNumber, range, length,
+            partSha256);
+      }
+      Duration uploadTime = Duration.between(hashed, Instant.now());
+      LOG.info("part_uploaded", "artifact", record.artifactId(), "part", partNumber,
+          "of", upload.partCount(), "bytes", length,
+          "hashDuration", Duration.between(started, hashed), "uploadDuration", uploadTime,
+          "mibPerSecond", StructuredLog.mibPerSecond(length, uploadTime),
+          "attempt", record.attempts());
+      return uploaded;
+    } catch (IOException | RuntimeException failure) {
+      LOG.warn("part_failed", "artifact", record.artifactId(), "part", partNumber,
+          "of", upload.partCount(), "bytes", length, "attempt", record.attempts(),
+          "duration", Duration.between(started, Instant.now()),
+          "error", failure.getClass().getSimpleName(), "reason", failure.getMessage());
+      throw failure;
     }
   }
 }

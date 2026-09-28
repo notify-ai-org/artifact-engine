@@ -13,8 +13,11 @@ import dev.notify.artifact.store.ObjectStore;
 import dev.notify.artifact.store.VectorStore;
 import dev.notify.artifact.util.Checksum;
 import dev.notify.artifact.util.Chunker;
+import dev.notify.artifact.util.StructuredLog;
 import java.io.IOException;
 import java.io.InputStream;
+import java.time.Duration;
+import java.time.Instant;
 import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
@@ -27,6 +30,8 @@ import java.util.Optional;
 
 /** Restart-safe indexing pipeline with deterministic chunk/vector identities. */
 public final class IndexJob extends AbstractJob<Integer> implements QueueableJob<Integer> {
+  private static final StructuredLog LOG = StructuredLog.of(IndexJob.class);
+
   /** What to do when a document produces more chunks than {@link Options#maxChunks()}. */
   public enum ChunkLimitPolicy {
     /** Stop extracting and fail the job; nothing becomes searchable. */
@@ -144,18 +149,25 @@ public final class IndexJob extends AbstractJob<Integer> implements QueueableJob
   @Override
   public Integer execute() throws Exception {
     Artifact artifact = requiredArtifact();
+    Instant started = Instant.now();
+    LOG.info("index_started", "artifact", artifactId, "version", artifact.version(),
+        "type", artifact.mediaType(), "bytes", artifact.sizeBytes(),
+        "model", embeddingService.model(), "maxChunks", options.maxChunks(),
+        "policy", options.chunkLimitPolicy());
+    ChunkWriter writer = new ChunkWriter(artifact);
     try {
       updateIndex(ArtifactStatus.Index.EXTRACTING);
 
       // Extraction, chunking, and embedding run as one pipeline: text flows from the extractor
       // into the chunker, and chunks are embedded and committed in bounded batches. Partial
       // results stay invisible to search until the artifact is marked READY.
-      ChunkWriter writer = new ChunkWriter(artifact);
       int chunkCount;
       boolean truncated = false;
       try (LocalContent content = localContent(artifact)) {
         chunkCount = extractInto(artifact, content.path(), writer);
       } catch (ChunkLimitReached limit) {
+        LOG.warn("index_chunk_budget_reached", "artifact", artifactId,
+            "maxChunks", options.maxChunks(), "policy", options.chunkLimitPolicy());
         if (options.chunkLimitPolicy() == ChunkLimitPolicy.FAIL) {
           throw new ChunkLimitExceededException(limitMessage());
         }
@@ -165,6 +177,9 @@ public final class IndexJob extends AbstractJob<Integer> implements QueueableJob
       writer.flush();
       vectorStore.deleteChunksFrom(
           tenantId, artifactId, embeddingService.model(), embeddingService.version(), chunkCount);
+      LOG.info("index_completed", "artifact", artifactId, "chunks", chunkCount,
+          "embedded", writer.embedded, "reused", writer.reused, "batches", writer.batches,
+          "truncated", truncated, "duration", Duration.between(started, Instant.now()));
 
       // Clearing the failure fields also drops a stale truncation flag from an earlier version.
       String code = truncated ? "INDEX_TRUNCATED" : null;
@@ -177,6 +192,13 @@ public final class IndexJob extends AbstractJob<Integer> implements QueueableJob
                   current.storageStatus(), ArtifactStatus.Index.READY, code, message));
       return chunkCount;
     } catch (Exception failure) {
+      String code = failure instanceof ChunkLimitExceededException
+          ? "INDEX_CHUNK_LIMIT_EXCEEDED"
+          : "INDEXING_FAILED";
+      LOG.warn("index_failed", "artifact", artifactId, "code", code,
+          "embedded", writer.embedded, "reused", writer.reused,
+          "duration", Duration.between(started, Instant.now()),
+          "error", failure.getClass().getSimpleName(), "reason", safeMessage(failure));
       metadataStore.update(
           tenantId,
           artifactId,
@@ -184,9 +206,7 @@ public final class IndexJob extends AbstractJob<Integer> implements QueueableJob
               current.withFailure(
                   current.storageStatus(),
                   ArtifactStatus.Index.RETRY_PENDING,
-                  failure instanceof ChunkLimitExceededException
-                      ? "INDEX_CHUNK_LIMIT_EXCEEDED"
-                      : "INDEXING_FAILED",
+                  code,
                   safeMessage(failure)));
       throw failure;
     }
@@ -209,15 +229,21 @@ public final class IndexJob extends AbstractJob<Integer> implements QueueableJob
   private int extractInto(Artifact artifact, Path file, ChunkWriter writer) throws IOException {
     var nativeExtractor = extractorFactory.find(artifact.mediaType());
     if (nativeExtractor.isPresent()) {
+      LOG.debug("index_extracting", "artifact", artifactId,
+          "extractor", nativeExtractor.get().getClass().getSimpleName());
       Chunker.Session session = chunker.stream(writer);
       nativeExtractor.get().extract(file, session::accept);
       int chunkCount = session.finish();
       if (chunkCount > 0) {
         return chunkCount;
       }
+      LOG.info("index_extracted_no_text", "artifact", artifactId,
+          "extractor", nativeExtractor.get().getClass().getSimpleName(),
+          "ocrAvailable", ocr != null);
     }
 
     if (ocr != null && artifact.mediaType().startsWith("image/")) {
+      LOG.info("index_ocr_started", "artifact", artifactId, "type", artifact.mediaType());
       Chunker.Session session = chunker.stream(writer);
       try (InputStream image = Files.newInputStream(file)) {
         session.accept(ocr.recognize(image, artifact.mediaType()));
@@ -235,20 +261,28 @@ public final class IndexJob extends AbstractJob<Integer> implements QueueableJob
     if (artifact.spoolPath() != null) {
       Optional<Path> spooled = durableSpool.existingContent(artifact.spoolPath());
       if (spooled.isPresent()) {
+        LOG.debug("index_source", "artifact", artifactId, "source", "spool");
         return new LocalContent(spooled.get(), false);
       }
     }
     if (artifact.storageKey() == null
         || artifact.storageStatus() != ArtifactStatus.Storage.STORED) {
+      LOG.warn("index_content_unavailable", "artifact", artifactId,
+          "storage", artifact.storageStatus(), "spoolRecorded", artifact.spoolPath() != null);
       throw new NoSuchFileException("Artifact content is not available for indexing");
     }
     Path scratch = durableSpool.scratchFile();
+    Instant downloadStarted = Instant.now();
     try (InputStream stored = objectStore.get(tenantId, artifact.storageKey())) {
       Files.copy(stored, scratch, StandardCopyOption.REPLACE_EXISTING);
     } catch (IOException | RuntimeException downloadFailure) {
       Files.deleteIfExists(scratch);
       throw downloadFailure;
     }
+    Duration downloaded = Duration.between(downloadStarted, Instant.now());
+    LOG.info("index_source", "artifact", artifactId, "source", "object_store",
+        "bytes", artifact.sizeBytes(), "duration", downloaded,
+        "mibPerSecond", StructuredLog.mibPerSecond(artifact.sizeBytes(), downloaded));
     return new LocalContent(scratch, true);
   }
 
@@ -265,6 +299,10 @@ public final class IndexJob extends AbstractJob<Integer> implements QueueableJob
     private final List<String> texts = new ArrayList<>(options.commitBatchSize());
     private int firstIndex;
     private boolean embeddingStarted;
+    // Totals for the job summary; the writer runs on a single thread.
+    private int embedded;
+    private int reused;
+    private int batches;
 
     private ChunkWriter(Artifact artifact) {
       this.artifact = artifact;
@@ -329,6 +367,12 @@ public final class IndexJob extends AbstractJob<Integer> implements QueueableJob
         }
         vectorStore.upsertAll(chunks);
       }
+      batches++;
+      embedded += pendingTexts.size();
+      reused += texts.size() - pendingTexts.size();
+      LOG.debug("index_batch_committed", "artifact", artifactId, "batch", batches,
+          "firstChunk", firstIndex, "chunks", texts.size(), "embedded", pendingTexts.size(),
+          "reused", texts.size() - pendingTexts.size());
       texts.clear();
     }
 

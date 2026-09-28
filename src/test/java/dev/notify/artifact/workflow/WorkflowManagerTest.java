@@ -226,6 +226,53 @@ class WorkflowManagerTest {
     }
   }
 
+  @Test
+  void logsTheWorkflowLifecycleAsStructuredEvents() {
+    java.util.logging.Logger julLogger =
+        java.util.logging.Logger.getLogger(WorkflowManager.class.getName());
+    List<String> lines = new java.util.concurrent.CopyOnWriteArrayList<>();
+    java.util.logging.Handler capture = new java.util.logging.Handler() {
+      @Override
+      public void publish(java.util.logging.LogRecord record) {
+        lines.add(record.getMessage());
+      }
+
+      @Override
+      public void flush() {}
+
+      @Override
+      public void close() {}
+    };
+    julLogger.addHandler(capture);
+    try (QueueManager queues = new QueueManager();
+        WorkflowManager manager = new WorkflowManager(
+            new InMemoryWorkflowStore(), queues, Duration.ofSeconds(1), failure -> {})) {
+      Workflow workflow = manager.createStaged("multipart", List.of(
+          List.of(job("part-1", JobRecord.JobType.STORE_PART),
+              job("part-2", JobRecord.JobType.STORE_PART)),
+          List.of(job("complete", JobRecord.JobType.STORE_COMPLETE))),
+          Map.of("artifactId", "artifact-7"));
+      manager.runOnce();
+      complete(manager, "part-1", JobRecord.JobType.STORE_PART);
+      manager.accept(stateChange("part-2", JobRecord.JobType.STORE_PART,
+          JobStateMachines.State.DEAD_LETTER, "S3 unavailable"));
+
+      assertTrue(lines.stream().anyMatch(line -> line.startsWith("event=workflow_created ")
+          && line.contains("workflow=" + workflow.id())
+          && line.contains("artifact=artifact-7")
+          && line.contains("plan=STORE_PARTx2,STORE_COMPLETE")), lines::toString);
+      assertTrue(lines.stream().anyMatch(line -> line.startsWith("event=stage_submitted ")
+          && line.contains("stage=0") && line.contains("steps=2")), lines::toString);
+      assertTrue(lines.stream().anyMatch(line -> line.startsWith("event=step_dead_lettered ")
+          && line.contains("job=part-2") && line.contains("reason=\"S3 unavailable\"")),
+          lines::toString);
+      assertTrue(lines.stream().anyMatch(line -> line.startsWith("event=workflow_crashed ")
+          && line.contains("completedSteps=1/3")), lines::toString);
+    } finally {
+      julLogger.removeHandler(capture);
+    }
+  }
+
   private static void complete(WorkflowManager manager, String jobId, JobRecord.JobType type) {
     manager.accept(stateChange(jobId, type, JobStateMachines.State.COMPLETED, "job completed"));
   }

@@ -2,6 +2,7 @@ package dev.notify.artifact.workflow;
 
 import dev.notify.artifact.model.JobRecord;
 import dev.notify.artifact.queue.QueueManager;
+import dev.notify.artifact.util.StructuredLog;
 import dev.notify.artifact.worker.JobStateMachines;
 import dev.notify.artifact.worker.Worker;
 import dev.notify.artifact.worker.WorkerManager;
@@ -33,6 +34,7 @@ import java.util.function.Consumer;
  * step dead-letters, and stays crashed even if parallel siblings complete afterwards.
  */
 public final class WorkflowManager implements AutoCloseable, Consumer<Worker.StateChange> {
+  private static final StructuredLog LOG = StructuredLog.of(WorkflowManager.class);
   private static final int RECOVERY_BATCH = 500;
   private final WorkflowStore store;
   private final QueueManager queues;
@@ -120,8 +122,20 @@ public final class WorkflowManager implements AutoCloseable, Consumer<Worker.Sta
             workflowId, name, now, now, WorkflowStatus.PENDING, null, null, steps,
             attributes, null);
     Workflow persisted = store.create(workflow);
+    LOG.info("workflow_created", "workflow", workflowId, "name", name,
+        "artifact", attributes.get("artifactId"), "stages", plan.size(), "steps", total,
+        "plan", describe(plan));
     wakeUp();
     return persisted;
+  }
+
+  /** Stage shapes such as {@code STORE_INIT,STORE_PARTx80,STORE_COMPLETE,INDEX}. */
+  private static String describe(List<List<JobRecord>> plan) {
+    return plan.stream()
+        .map(stage -> stage.size() == 1
+            ? stage.get(0).type().name()
+            : stage.get(0).type().name() + "x" + stage.size())
+        .collect(Collectors.joining(","));
   }
 
   /** Called once for each workflow that transitions to {@link WorkflowStatus#CRASHED}. */
@@ -131,6 +145,8 @@ public final class WorkflowManager implements AutoCloseable, Consumer<Worker.Sta
 
   public void start() {
     if (!started.compareAndSet(false, true)) return;
+    LOG.info("workflow_manager_started", "pollInterval", pollInterval,
+        "crashListeners", crashListeners.size());
     safeRecover();
     scheduler.scheduleWithFixedDelay(
         this::safeDispatch, pollInterval.toMillis(), pollInterval.toMillis(), TimeUnit.MILLISECONDS);
@@ -150,24 +166,76 @@ public final class WorkflowManager implements AutoCloseable, Consumer<Worker.Sta
                 || state == JobStateMachines.State.RETRY_PENDING
             ? stateChange.transition().reason()
             : null;
-    store
-        .findByJobRecordId(jobRecordId)
-        .ifPresent(
-            workflow -> {
-              AtomicReference<WorkflowStatus> before = new AtomicReference<>();
-              Workflow updated =
-                  store.update(
-                      workflow.id(),
-                      current -> {
-                        before.set(current.status());
-                        return apply(current, jobRecordId, state, failureMessage);
-                      });
-              if (updated.status() == WorkflowStatus.CRASHED
-                  && before.get() != WorkflowStatus.CRASHED) {
-                notifyCrashed(updated);
-              }
-            });
+    var owner = store.findByJobRecordId(jobRecordId);
+    if (owner.isEmpty()) {
+      LOG.debug("step_state_unmatched", "job", jobRecordId, "type", stateChange.jobType(),
+          "state", state);
+    }
+    owner.ifPresent(
+        workflow -> {
+          AtomicReference<WorkflowStatus> before = new AtomicReference<>();
+          Workflow updated =
+              store.update(
+                  workflow.id(),
+                  current -> {
+                    before.set(current.status());
+                    return apply(current, jobRecordId, state, failureMessage);
+                  });
+          logTransition(updated, before.get(), stateChange, failureMessage);
+          if (updated.status() == WorkflowStatus.CRASHED
+              && before.get() != WorkflowStatus.CRASHED) {
+            notifyCrashed(updated);
+          }
+        });
     wakeUp();
+  }
+
+  private static void logTransition(
+      Workflow workflow,
+      WorkflowStatus before,
+      Worker.StateChange change,
+      String failureMessage) {
+    WorkflowStep step = workflow.workflowSteps().stream()
+        .filter(candidate -> candidate.jobRecordId().equals(change.jobId()))
+        .findFirst()
+        .orElse(null);
+    JobStateMachines.State state = change.transition().to();
+    if (state == JobStateMachines.State.DEAD_LETTER) {
+      LOG.warn("step_dead_lettered", "workflow", workflow.id(), "job", change.jobId(),
+          "type", change.jobType(), "stage", step == null ? null : step.stage(),
+          "worker", change.workerId(), "reason", failureMessage);
+    } else if (state == JobStateMachines.State.RETRY_PENDING) {
+      LOG.info("step_retry_scheduled", "workflow", workflow.id(), "job", change.jobId(),
+          "type", change.jobType(), "worker", change.workerId(), "reason", failureMessage);
+    } else if (LOG.debugEnabled()) {
+      LOG.debug("step_state", "workflow", workflow.id(), "job", change.jobId(),
+          "type", change.jobType(), "state", state, "step",
+          step == null ? null : step.status(), "worker", change.workerId(),
+          "completedSteps", completedSteps(workflow) + "/" + workflow.workflowSteps().size());
+    }
+    if (workflow.status() == before) return;
+    Duration elapsed = workflow.processStartAt() == null || workflow.processEndAt() == null
+        ? null
+        : Duration.between(workflow.processStartAt(), workflow.processEndAt());
+    if (workflow.status() == WorkflowStatus.COMPLETED) {
+      LOG.info("workflow_completed", "workflow", workflow.id(), "name", workflow.name(),
+          "artifact", workflow.attributes().get("artifactId"),
+          "steps", workflow.workflowSteps().size(), "retries", workflow.retryAttempts(),
+          "duration", elapsed);
+    } else if (workflow.status() == WorkflowStatus.CRASHED) {
+      LOG.warn("workflow_crashed", "workflow", workflow.id(), "name", workflow.name(),
+          "artifact", workflow.attributes().get("artifactId"),
+          "failedJob", change.jobId(), "type", change.jobType(),
+          "completedSteps", completedSteps(workflow) + "/" + workflow.workflowSteps().size(),
+          "retries", workflow.retryAttempts(), "duration", elapsed,
+          "reason", workflow.failureMessage());
+    }
+  }
+
+  private static long completedSteps(Workflow workflow) {
+    return workflow.workflowSteps().stream()
+        .filter(step -> step.status() == WorkflowStepStatus.COMPLETED)
+        .count();
   }
 
   private void submitReadySteps(Workflow workflow) {
@@ -182,6 +250,17 @@ public final class WorkflowManager implements AutoCloseable, Consumer<Worker.Sta
     Set<String> readyIds = ready.stream().map(WorkflowStep::id).collect(Collectors.toSet());
     Instant now = Instant.now();
     store.update(workflow.id(), current -> markSubmitted(current, readyIds, now));
+    if (LOG.debugEnabled()) {
+      for (WorkflowStep step : ready) {
+        LOG.debug("step_submitted", "workflow", workflow.id(), "step", step.id(),
+            "job", step.jobRecordId(), "type", step.jobRecord().type(), "stage", step.stage(),
+            "priority", step.jobRecord().priority());
+      }
+    }
+    LOG.info("stage_submitted", "workflow", workflow.id(), "name", workflow.name(),
+        "stage", ready.get(0).stage(), "type", ready.get(0).jobRecord().type(),
+        "steps", ready.size(), "priority", ready.get(0).jobRecord().priority(),
+        "retry", workflow.retryAttempts());
   }
 
   /**
@@ -274,6 +353,8 @@ public final class WorkflowManager implements AutoCloseable, Consumer<Worker.Sta
       try {
         listener.accept(workflow);
       } catch (Throwable failure) {
+        LOG.error("crash_listener_failed", failure, "workflow", workflow.id(),
+            "listener", listener.getClass().getName());
         failureHandler.accept(failure);
       }
     }
@@ -283,14 +364,20 @@ public final class WorkflowManager implements AutoCloseable, Consumer<Worker.Sta
     try {
       runOnce();
     } catch (Throwable failure) {
+      LOG.error("workflow_dispatch_failed", failure);
       failureHandler.accept(failure);
     }
   }
 
   private void safeRecover() {
     try {
-      for (Workflow workflow : store.recoverable()) dispatchPendingSteps(workflow);
+      List<Workflow> recoverable = store.recoverable();
+      int requeued = 0;
+      for (Workflow workflow : recoverable) requeued += dispatchPendingSteps(workflow);
+      LOG.info("workflow_recovery_completed", "workflows", recoverable.size(),
+          "requeuedSteps", requeued);
     } catch (Throwable failure) {
+      LOG.error("workflow_recovery_failed", failure);
       failureHandler.accept(failure);
     }
   }
@@ -298,16 +385,23 @@ public final class WorkflowManager implements AutoCloseable, Consumer<Worker.Sta
   /**
    * Re-queues steps that were already dispatched before a restart, then submits PENDING steps
    * through the normal stage-aware path so a later stage never starts before an earlier one ends.
+   *
+   * @return how many dispatched steps were re-queued
    */
-  private void dispatchPendingSteps(Workflow workflow) {
+  private int dispatchPendingSteps(Workflow workflow) {
     Instant now = Instant.now();
+    int requeued = 0;
     for (WorkflowStep step : workflow.workflowSteps()) {
       if (step.status() == WorkflowStepStatus.SUBMITTED
           || step.status() == WorkflowStepStatus.RUNNING) {
         queues.requeue(step.jobRecord(), now);
+        requeued++;
+        LOG.debug("step_requeued", "workflow", workflow.id(), "job", step.jobRecordId(),
+            "type", step.jobRecord().type(), "status", step.status());
       }
     }
     submitReadySteps(workflow);
+    return requeued;
   }
 
   /** Submits ready steps now instead of at the next poll, e.g. after a workflow was resumed. */
@@ -321,6 +415,7 @@ public final class WorkflowManager implements AutoCloseable, Consumer<Worker.Sta
 
   @Override
   public void close() {
+    if (started.get()) LOG.info("workflow_manager_stopped");
     started.set(false);
     if (workerManager != null) {
       workerManager.removeStateChangeListener(this);

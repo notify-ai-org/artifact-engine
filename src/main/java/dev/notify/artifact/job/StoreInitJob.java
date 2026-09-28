@@ -8,6 +8,7 @@ import dev.notify.artifact.store.MultipartUploadStore;
 import dev.notify.artifact.store.MultipartUploadStore.MultipartUpload;
 import dev.notify.artifact.store.ObjectStore;
 import dev.notify.artifact.util.StorageKeyFactory;
+import dev.notify.artifact.util.StructuredLog;
 import java.io.IOException;
 import java.time.Instant;
 import java.util.Objects;
@@ -15,6 +16,8 @@ import java.util.Optional;
 
 /** Starts the multipart upload for an artifact version, once, even when retried or raced. */
 public final class StoreInitJob extends AbstractJob<Artifact> {
+  private static final StructuredLog LOG = StructuredLog.of(StoreInitJob.class);
+
   private final JobRecord record;
   private final ObjectStore objectStore;
   private final MultipartUploadStore uploads;
@@ -42,6 +45,8 @@ public final class StoreInitJob extends AbstractJob<Artifact> {
     MultipartUpload upload;
     if (existing.isPresent()) {
       upload = existing.get();
+      LOG.info("multipart_reused", "artifact", record.artifactId(), "version", version,
+          "upload", upload.uploadId(), "parts", upload.partCount());
     } else {
       String key = keyFactory.key(artifact);
       String uploadId = objectStore.createMultipartUpload(record.tenantId(), key, artifact.sha256());
@@ -53,7 +58,13 @@ public final class StoreInitJob extends AbstractJob<Artifact> {
                   (int) longAttribute(record, "partCount"), Instant.now(), null));
       if (!upload.uploadId().equals(uploadId)) {
         // A concurrent attempt registered first; use its upload and discard ours.
+        LOG.warn("multipart_race_lost", "artifact", record.artifactId(), "version", version,
+            "kept", upload.uploadId(), "aborted", uploadId);
         objectStore.abortMultipartUpload(record.tenantId(), key, uploadId);
+      } else {
+        LOG.info("multipart_started", "artifact", record.artifactId(), "version", version,
+            "upload", uploadId, "bytes", artifact.sizeBytes(), "parts", upload.partCount(),
+            "partSize", upload.partSize());
       }
     }
     String key = upload.storageKey();

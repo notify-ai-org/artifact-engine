@@ -9,7 +9,10 @@ import dev.notify.artifact.store.MultipartUploadStore;
 import dev.notify.artifact.store.MultipartUploadStore.MultipartUpload;
 import dev.notify.artifact.store.ObjectStore;
 import dev.notify.artifact.store.ObjectStore.UploadedPart;
+import dev.notify.artifact.util.StructuredLog;
 import java.io.IOException;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
@@ -22,6 +25,8 @@ import java.util.Optional;
  * already completed (its part list is gone), it verifies the object against the saved checksum.
  */
 public final class StoreCompleteJob extends AbstractJob<Artifact> {
+  private static final StructuredLog LOG = StructuredLog.of(StoreCompleteJob.class);
+
   private final JobRecord record;
   private final ObjectStore objectStore;
   private final MultipartUploadStore uploads;
@@ -44,26 +49,42 @@ public final class StoreCompleteJob extends AbstractJob<Artifact> {
     Optional<MultipartUpload> found = uploads.find(record.tenantId(), record.artifactId(), version);
     if (found.isEmpty()) {
       if (artifact.storageStatus() == ArtifactStatus.Storage.STORED) {
+        LOG.info("multipart_already_stored", "artifact", record.artifactId(), "version", version);
         return artifact;
       }
+      LOG.warn("multipart_not_initialized", "artifact", record.artifactId(), "version", version,
+          "storage", artifact.storageStatus());
       throw new IllegalStateException("Multipart upload was not initialized");
     }
     MultipartUpload upload = found.get();
     String key = upload.storageKey();
+    Instant started = Instant.now();
     try {
-      if (upload.compositeSha256() == null || !alreadyCompleted(artifact, upload)) {
+      if (upload.compositeSha256() != null && alreadyCompleted(artifact, upload)) {
+        LOG.info("multipart_resumed_after_completion", "artifact", record.artifactId(),
+            "upload", upload.uploadId(), "composite", upload.compositeSha256());
+      } else {
         List<UploadedPart> parts =
             objectStore.listParts(record.tenantId(), key, upload.uploadId());
+        LOG.info("multipart_completing", "artifact", record.artifactId(),
+            "upload", upload.uploadId(), "partsFound", parts.size(),
+            "partsExpected", upload.partCount(), "bytes", artifact.sizeBytes());
         requireAllParts(parts, artifact.sizeBytes(), upload);
         String composite = ObjectStore.compositeSha256(parts);
         uploads.recordComposite(record.tenantId(), record.artifactId(), version, composite);
         objectStore.completeMultipartUpload(record.tenantId(), key, upload.uploadId(), parts);
+        LOG.debug("multipart_assembled", "artifact", record.artifactId(),
+            "composite", composite, "duration", Duration.between(started, Instant.now()));
         if (!objectStore.verifiedMultipart(
             record.tenantId(), key, artifact.sizeBytes(), artifact.sha256(), composite)) {
           throw new IOException("Object store did not verify the assembled artifact");
         }
       }
     } catch (IOException | RuntimeException failure) {
+      LOG.warn("multipart_complete_failed", "artifact", record.artifactId(),
+          "upload", upload.uploadId(), "attempt", record.attempts(),
+          "duration", Duration.between(started, Instant.now()),
+          "error", failure.getClass().getSimpleName(), "reason", safeMessage(failure));
       metadataStore.update(
           record.tenantId(),
           record.artifactId(),
@@ -79,10 +100,14 @@ public final class StoreCompleteJob extends AbstractJob<Artifact> {
     }
 
     uploads.delete(record.tenantId(), record.artifactId(), version);
-    return metadataStore.update(
+    Artifact stored = metadataStore.update(
         record.tenantId(),
         record.artifactId(),
         current -> current.withStorage(ArtifactStatus.Storage.STORED, key));
+    LOG.info("multipart_stored", "artifact", record.artifactId(), "version", version,
+        "bytes", artifact.sizeBytes(), "parts", upload.partCount(),
+        "uploadAge", Duration.between(upload.createdAt(), Instant.now()));
+    return stored;
   }
 
   private boolean alreadyCompleted(Artifact artifact, MultipartUpload upload) throws IOException {

@@ -12,7 +12,9 @@ import dev.notify.artifact.spool.DurableSpool;
 import dev.notify.artifact.store.MetadataStore;
 import dev.notify.artifact.util.Checksum;
 import dev.notify.artifact.util.Idempotency;
+import dev.notify.artifact.util.StructuredLog;
 import java.io.IOException;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
@@ -24,6 +26,8 @@ import dev.notify.artifact.workflow.WorkflowManager;
  * Durable intake workflow: authorize, spool, verify, register metadata, and publish outbox jobs.
  */
 public final class IngestJob extends AbstractJob<Artifact> implements DirectJob<Artifact> {
+  private static final StructuredLog LOG = StructuredLog.of(IngestJob.class);
+
   private final Requests.Ingest request;
   private final DurableSpool durableSpool;
   private final ArtifactAccessVerifier accessVerifier;
@@ -64,16 +68,37 @@ public final class IngestJob extends AbstractJob<Artifact> implements DirectJob<
   @Override
   public void prepare() throws IOException {
     if (spoolEntry != null) return;
-    accessVerifier.authenticate(
-        request.principalId(), request.tenantId(), AuthorizationService.Permission.INGEST);
+    try {
+      accessVerifier.authenticate(
+          request.principalId(), request.tenantId(), AuthorizationService.Permission.INGEST);
+    } catch (RuntimeException denied) {
+      // The message may name the principal or tenant; log only the kind of refusal.
+      LOG.warn("ingest_unauthorized", "error", denied.getClass().getSimpleName());
+      throw denied;
+    }
     String id = UUID.randomUUID().toString();
-    spoolEntry = durableSpool.write(request.tenantId(), id, request.content(), request.metadata());
+    Instant started = Instant.now();
+    LOG.debug("ingest_spooling", "artifact", id, "declaredBytes", request.contentLength(),
+        "declaredType", request.declaredMediaType());
+    try {
+      spoolEntry =
+          durableSpool.write(request.tenantId(), id, request.content(), request.metadata());
+    } catch (IOException | RuntimeException failure) {
+      LOG.warn("ingest_spool_failed", "artifact", id, "error", failure.getClass().getSimpleName(),
+          "reason", failure.getMessage(), "duration", Duration.between(started, Instant.now()));
+      throw failure;
+    }
     artifactId = id;
+    Duration elapsed = Duration.between(started, Instant.now());
+    LOG.info("ingest_spooled", "artifact", id, "bytes", spoolEntry.sizeBytes(),
+        "duration", elapsed, "mibPerSecond",
+        StructuredLog.mibPerSecond(spoolEntry.sizeBytes(), elapsed));
   }
 
   @Override
   public void abandon() {
     if (!claimed.compareAndSet(false, true) || spoolEntry == null) return;
+    LOG.warn("ingest_abandoned", "artifact", artifactId, "bytes", spoolEntry.sizeBytes());
     try {
       durableSpool.discard(spoolEntry.contentPath());
     } catch (IOException ignored) {
@@ -104,6 +129,8 @@ public final class IngestJob extends AbstractJob<Artifact> implements DirectJob<
       detectedMediaType = verified.detectedMediaType();
       sanitizedFilename = verified.sanitizedFilename();
     } catch (IOException | RuntimeException verificationFailure) {
+      LOG.warn("ingest_rejected", "artifact", artifactId, "bytes", spoolEntry.sizeBytes(),
+          "declaredType", request.declaredMediaType(), "reason", verificationFailure.getMessage());
       discardFailedIntake(spoolEntry.contentPath(), verificationFailure);
       throw verificationFailure;
     }
@@ -112,6 +139,8 @@ public final class IngestJob extends AbstractJob<Artifact> implements DirectJob<
       IllegalArgumentException mismatch =
           new IllegalArgumentException(
               "Declared content length does not match the streamed artifact length");
+      LOG.warn("ingest_rejected", "artifact", artifactId, "reason", "length_mismatch",
+          "declaredBytes", request.contentLength(), "bytes", spoolEntry.sizeBytes());
       discardFailedIntake(spoolEntry.contentPath(), mismatch);
       throw mismatch;
     }
@@ -154,21 +183,36 @@ public final class IngestJob extends AbstractJob<Artifact> implements DirectJob<
       MetadataStore.Registration registration =
           metadataStore.register(
               artifact, options.deduplicateContent());
+      String workflowId = null;
       if (registration.outcome() == MetadataStore.Registration.Outcome.CREATED
           && workflowManager != null) {
-        workflowManager.createStaged(
+        workflowId = workflowManager.createStaged(
             "ingest-store-index",
             stages,
             Map.of(
                 "tenantId", artifact.tenantId(),
                 "artifactId", artifact.id(),
-                "version", Long.toString(artifact.version())));
+                "version", Long.toString(artifact.version()))).id();
       }
-      if (registration.outcome() != MetadataStore.Registration.Outcome.CREATED) {
+      if (registration.outcome() == MetadataStore.Registration.Outcome.CREATED) {
+        int parts = stages.get(0).get(0).type() == JobRecord.JobType.STORE_INIT
+            ? stages.get(1).size()
+            : 0;
+        LOG.info("ingest_registered", "artifact", artifact.id(), "type", detectedMediaType,
+            "bytes", artifact.sizeBytes(), "storage", parts > 0 ? "multipart" : "single",
+            "parts", parts, "workflow", workflowId);
+        if (workflowId == null) {
+          LOG.warn("ingest_not_scheduled", "artifact", artifact.id(),
+              "reason", "no workflow manager; the artifact will not be stored or indexed");
+        }
+      } else {
+        LOG.info("ingest_deduplicated", "artifact", artifactId,
+            "existingArtifact", registration.artifact().id(), "outcome", registration.outcome());
         durableSpool.discard(spoolEntry.contentPath());
       }
       return registration.artifact();
     } catch (RuntimeException registrationFailure) {
+      LOG.error("ingest_registration_failed", registrationFailure, "artifact", artifactId);
       discardFailedIntake(spoolEntry.contentPath(), registrationFailure);
       throw registrationFailure;
     }
