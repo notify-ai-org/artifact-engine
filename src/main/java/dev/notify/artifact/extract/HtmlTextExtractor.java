@@ -1,8 +1,10 @@
 package dev.notify.artifact.extract;
 
 import java.io.IOException;
-import java.io.InputStream;
+import java.nio.file.Path;
 import org.jsoup.Jsoup;
+
+import dev.notify.artifact.util.TextSink;
 
 /** Extracts visible text from UTF-8 HTML without retaining markup or executable content. */
 public final class HtmlTextExtractor implements TextExtractor {
@@ -20,9 +22,10 @@ public final class HtmlTextExtractor implements TextExtractor {
   }
 
   @Override
-  public String extract(InputStream content) throws IOException {
-    String visibleText = Jsoup.parse(BoundedContent.utf8(content, maxInputBytes)).text();
-    return BoundedContent.text(visibleText, maxCharacters);
+  public void extract(Path file, TextSink sink) throws IOException {
+    // jsoup builds a full DOM; the byte bound keeps that proportional to a sane HTML page.
+    String visibleText = Jsoup.parse(BoundedContent.utf8(file, maxInputBytes)).text();
+    BoundedContent.limit(sink, maxCharacters).accept(visibleText);
   }
 
   private static int positive(int value, String name) {

@@ -10,9 +10,13 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.HashMap;
+import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 
 /**
@@ -25,6 +29,7 @@ public final class DurableSpool {
   private static final int COPY_BUFFER_BYTES = 64 * 1024;
   private static final String CONTENT_FILE = "content.pending";
   private static final String METADATA_FILE = "metadata.json";
+  private static final String SCRATCH_DIRECTORY = ".scratch";
 
   private final Path root;
   private final Limits limits;
@@ -55,10 +60,10 @@ public final class DurableSpool {
 
     Path temporaryContent = directory.resolve(UUID.randomUUID() + ".content.tmp");
     Path publishedContent = directory.resolve(CONTENT_FILE);
-    long reservedBytes = 0;
+    Copy copy = new Copy();
     reserveFile(tenantHash);
     try {
-      reservedBytes = streamToFile(source, temporaryContent, tenantHash);
+      streamToFile(source, temporaryContent, tenantHash, copy);
       forceFile(temporaryContent);
 
       Files.move(
@@ -67,17 +72,13 @@ public final class DurableSpool {
           StandardCopyOption.ATOMIC_MOVE,
           StandardCopyOption.REPLACE_EXISTING);
       publishMetadata(directory, metadata);
-
-      String sha256;
-      try (InputStream input = Files.newInputStream(publishedContent)) {
-        sha256 = Checksum.sha256(input);
-      }
-      return new SpoolEntry(publishedContent, reservedBytes, sha256);
+      return new SpoolEntry(publishedContent, copy.bytes, copy.sha256());
     } catch (Exception failure) {
       Files.deleteIfExists(temporaryContent);
       Files.deleteIfExists(publishedContent);
       Files.deleteIfExists(directory.resolve(METADATA_FILE));
-      release(tenantHash, reservedBytes, 1);
+      // copy.bytes counts every byte reserved so far, including a stream that failed midway.
+      release(tenantHash, copy.bytes, 1);
       deleteDirectoryIfEmpty(directory);
       throw failure;
     }
@@ -85,6 +86,83 @@ public final class DurableSpool {
 
   public InputStream open(Path path) throws IOException {
     return Files.newInputStream(requireContentPath(path));
+  }
+
+  /** Opens {@code length} bytes of a spool entry starting at {@code offset}. */
+  public InputStream openRange(Path path, long offset, long length) throws IOException {
+    if (offset < 0 || length < 0) {
+      throw new IllegalArgumentException("offset and length cannot be negative");
+    }
+    FileChannel channel = FileChannel.open(requireContentPath(path), StandardOpenOption.READ);
+    try {
+      if (offset + length > channel.size()) {
+        throw new IOException("Requested range exceeds the spooled content");
+      }
+      channel.position(offset);
+      return new RangeInputStream(java.nio.channels.Channels.newInputStream(channel), length);
+    } catch (IOException | RuntimeException failure) {
+      channel.close();
+      throw failure;
+    }
+  }
+
+  /** Reads at most a fixed number of bytes from the underlying stream. */
+  private static final class RangeInputStream extends java.io.FilterInputStream {
+    private long remaining;
+
+    private RangeInputStream(InputStream input, long length) {
+      super(input);
+      this.remaining = length;
+    }
+
+    @Override
+    public int read() throws IOException {
+      if (remaining <= 0) return -1;
+      int value = super.read();
+      if (value >= 0) remaining--;
+      return value;
+    }
+
+    @Override
+    public int read(byte[] target, int offset, int length) throws IOException {
+      if (remaining <= 0) return -1;
+      int read = super.read(target, offset, (int) Math.min(length, remaining));
+      if (read > 0) remaining -= read;
+      return read;
+    }
+
+    @Override
+    public long skip(long count) throws IOException {
+      long skipped = super.skip(Math.min(count, remaining));
+      remaining -= skipped;
+      return skipped;
+    }
+
+    @Override
+    public int available() throws IOException {
+      return (int) Math.min(super.available(), remaining);
+    }
+
+    @Override
+    public boolean markSupported() {
+      return false;
+    }
+  }
+
+  /** Returns the validated spool content path if the entry is still present on disk. */
+  public Optional<Path> existingContent(Path path) {
+    Path content = requireContentPath(path);
+    return Files.isRegularFile(content) ? Optional.of(content) : Optional.empty();
+  }
+
+  /**
+   * Creates an empty scratch file on the spool volume for transient work such as staging an
+   * object-store download for random-access parsing. The caller must delete it. Scratch files are
+   * not spool entries and are not counted against quotas.
+   */
+  public Path scratchFile() throws IOException {
+    Path directory = Files.createDirectories(root.resolve(SCRATCH_DIRECTORY));
+    return Files.createTempFile(directory, "scratch-", ".tmp");
   }
 
   /** Removes a confirmed, unreferenced entry and releases its quota reservation. */
@@ -110,8 +188,13 @@ public final class DurableSpool {
     return new UsageSnapshot(totalBytes, totalFiles, Map.copyOf(tenantUsage));
   }
 
-  private long streamToFile(InputStream source, Path target, String tenantHash) throws IOException {
-    long artifactBytes = 0;
+  /**
+   * Copies, reserves quota, and hashes in one pass, so the content is never re-read to checksum it.
+   * The digest covers exactly the bytes written; the object store later verifies its upload against
+   * this digest while reading the spool file back, which also covers on-disk corruption.
+   */
+  private void streamToFile(InputStream source, Path target, String tenantHash, Copy copy)
+      throws IOException {
     try (var raw = Files.newOutputStream(target, StandardOpenOption.CREATE_NEW);
         var output = new BufferedOutputStream(raw, COPY_BUFFER_BYTES)) {
       byte[] buffer = new byte[COPY_BUFFER_BYTES];
@@ -119,16 +202,34 @@ public final class DurableSpool {
         if (read == 0) {
           continue;
         }
-        if (artifactBytes + read > limits.maxArtifactBytes()) {
+        if (copy.bytes + read > limits.maxArtifactBytes()) {
           throw new SpoolQuotaExceededException("Artifact exceeds the configured byte limit");
         }
         reserveBytes(tenantHash, read);
-        artifactBytes += read;
+        copy.bytes += read;
+        copy.digest.update(buffer, 0, read);
         output.write(buffer, 0, read);
       }
       output.flush();
     }
-    return artifactBytes;
+  }
+
+  /** Progress of one spool write, visible to the failure path for exact quota release. */
+  private static final class Copy {
+    private final MessageDigest digest = sha256Digest();
+    private long bytes;
+
+    private String sha256() {
+      return HexFormat.of().formatHex(digest.digest());
+    }
+
+    private static MessageDigest sha256Digest() {
+      try {
+        return MessageDigest.getInstance("SHA-256");
+      } catch (NoSuchAlgorithmException impossible) {
+        throw new IllegalStateException(impossible);
+      }
+    }
   }
 
   private void publishMetadata(Path directory, Map<String, ?> metadata) throws IOException {

@@ -48,10 +48,12 @@ public final class JdbiJobStore implements JobStore {
             """
             INSERT INTO artifact_job
               (id, tenant_id, artifact_id, job_type, status, attempts, next_attempt_at,
-               lease_owner, lease_expires_at, attributes_json, last_error, created_at, updated_at)
+               lease_owner, lease_expires_at, attributes_json, last_error, created_at, updated_at,
+               priority)
             VALUES
               (:id, :tenantId, :artifactId, :jobType, :status, :attempts, :nextAttemptAt,
-               :leaseOwner, :leaseExpiresAt, :attributesJson, :lastError, :createdAt, :updatedAt)
+               :leaseOwner, :leaseExpiresAt, :attributesJson, :lastError, :createdAt, :updatedAt,
+               :priority)
             ON CONFLICT (id) DO NOTHING
             """)
         .bind("id", job.id()).bind("tenantId", job.tenantId())
@@ -60,7 +62,8 @@ public final class JdbiJobStore implements JobStore {
         .bind("nextAttemptAt", job.nextAttemptAt()).bind("leaseOwner", job.leaseOwner())
         .bind("leaseExpiresAt", job.leaseExpiresAt())
         .bind("attributesJson", serialize(job.attributes())).bind("lastError", job.lastError())
-        .bind("createdAt", job.createdAt()).bind("updatedAt", job.updatedAt()).execute();
+        .bind("createdAt", job.createdAt()).bind("updatedAt", job.updatedAt())
+        .bind("priority", job.priority().name()).execute();
   }
 
   @Override
@@ -91,17 +94,19 @@ public final class JdbiJobStore implements JobStore {
             """
             INSERT INTO artifact_job
               (id, tenant_id, artifact_id, job_type, status, attempts, next_attempt_at,
-               lease_owner, lease_expires_at, attributes_json, last_error, created_at, updated_at)
+               lease_owner, lease_expires_at, attributes_json, last_error, created_at, updated_at,
+               priority)
             VALUES
               (:id, :tenantId, :artifactId, :jobType, :status, :attempts, :nextAttemptAt,
-               :leaseOwner, :leaseExpiresAt, :attributesJson, :lastError, :createdAt, :updatedAt)
+               :leaseOwner, :leaseExpiresAt, :attributesJson, :lastError, :createdAt, :updatedAt,
+               :priority)
             ON CONFLICT (id) DO UPDATE SET
               tenant_id = EXCLUDED.tenant_id, artifact_id = EXCLUDED.artifact_id,
               job_type = EXCLUDED.job_type, status = EXCLUDED.status,
               attempts = EXCLUDED.attempts, next_attempt_at = EXCLUDED.next_attempt_at,
               lease_owner = EXCLUDED.lease_owner, lease_expires_at = EXCLUDED.lease_expires_at,
               attributes_json = EXCLUDED.attributes_json, last_error = EXCLUDED.last_error,
-              updated_at = EXCLUDED.updated_at
+              updated_at = EXCLUDED.updated_at, priority = EXCLUDED.priority
             """)
         .bind("id", job.id()).bind("tenantId", job.tenantId())
         .bind("artifactId", job.artifactId()).bind("jobType", job.type().name())
@@ -109,7 +114,8 @@ public final class JdbiJobStore implements JobStore {
         .bind("nextAttemptAt", job.nextAttemptAt()).bind("leaseOwner", job.leaseOwner())
         .bind("leaseExpiresAt", job.leaseExpiresAt())
         .bind("attributesJson", serialize(job.attributes())).bind("lastError", job.lastError())
-        .bind("createdAt", job.createdAt()).bind("updatedAt", job.updatedAt()).execute();
+        .bind("createdAt", job.createdAt()).bind("updatedAt", job.updatedAt())
+        .bind("priority", job.priority().name()).execute();
   }
 
   Optional<JobRecord> find(Handle handle, String jobId) {
@@ -124,7 +130,8 @@ public final class JdbiJobStore implements JobStore {
                    next_attempt_at AS job_next_attempt_at, lease_owner AS job_lease_owner,
                    lease_expires_at AS job_lease_expires_at,
                    attributes_json AS job_attributes_json, last_error AS job_last_error,
-                   created_at AS job_created_at, updated_at AS job_updated_at
+                   created_at AS job_created_at, updated_at AS job_updated_at,
+                   priority AS job_priority
             FROM artifact_job WHERE id = :id
             """ + (lock ? " FOR UPDATE" : ""))
         .bind("id", jobId).map((resultSet, context) -> map(resultSet, "job_")).findOne();
@@ -141,7 +148,8 @@ public final class JdbiJobStore implements JobStore {
         instant(resultSet, prefix + "lease_expires_at"),
         attributes(resultSet.getString(prefix + "attributes_json")),
         resultSet.getString(prefix + "last_error"), instant(resultSet, prefix + "created_at"),
-        instant(resultSet, prefix + "updated_at"));
+        instant(resultSet, prefix + "updated_at"),
+        JobRecord.Priority.valueOf(resultSet.getString(prefix + "priority")));
   }
 
   private String serialize(Map<String, String> attributes) {

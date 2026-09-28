@@ -25,15 +25,21 @@ public final class RedisJobQueue implements JobQueue {
           return 1
           """;
 
+  /** Claims from the normal ready set (KEYS[1]) and falls back to the retry set (KEYS[3]). */
   private static final String CLAIM =
           """
-          local ids = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, 1)
+          local source = KEYS[1]
+          local ids = redis.call('ZRANGEBYSCORE', source, '-inf', ARGV[1], 'LIMIT', 0, 1)
+          if #ids == 0 then
+            source = KEYS[3]
+            ids = redis.call('ZRANGEBYSCORE', source, '-inf', ARGV[1], 'LIMIT', 0, 1)
+          end
           if #ids == 0 then return nil end
           local id = ids[1]
           local jobKey = ARGV[4] .. id
           local json = redis.call('GET', jobKey)
           if not json then
-            redis.call('ZREM', KEYS[1], id)
+            redis.call('ZREM', source, id)
             return nil
           end
           local job = cjson.decode(json)
@@ -44,7 +50,7 @@ public final class RedisJobQueue implements JobQueue {
           job.updatedAt = ARGV[5]
           local updated = cjson.encode(job)
           redis.call('SET', jobKey, updated)
-          redis.call('ZREM', KEYS[1], id)
+          redis.call('ZREM', source, id)
           redis.call('ZADD', KEYS[2], ARGV[6], id)
           return updated
           """;
@@ -95,7 +101,9 @@ public final class RedisJobQueue implements JobQueue {
               job.lastError = 'lease expired'
               job.updatedAt = ARGV[4]
               redis.call('SET', jobKey, cjson.encode(job))
-              redis.call('ZADD', ARGV[5] .. job.type, ARGV[1], id)
+              local ready = ARGV[5] .. job.type
+              if job.priority == 'RETRY' then ready = ready .. ':retry' end
+              redis.call('ZADD', ready, ARGV[1], id)
               recovered = recovered + 1
             end
             redis.call('ZREM', KEYS[1], id)
@@ -127,7 +135,7 @@ public final class RedisJobQueue implements JobQueue {
     redis.eval(
         ENQUEUE,
         ScriptOutputType.INTEGER,
-        new String[] {jobKey(job.id()), readyKey(job.type())},
+        new String[] {jobKey(job.id()), readyKey(job.type(), job.priority())},
         serialize(job),
         Long.toString(score(job.nextAttemptAt())),
         job.id());
@@ -138,7 +146,7 @@ public final class RedisJobQueue implements JobQueue {
     redis.eval(
         REQUEUE,
         ScriptOutputType.INTEGER,
-        new String[] {jobKey(job.id()), leasedKey(), readyKey(job.type())},
+        new String[] {jobKey(job.id()), leasedKey(), readyKey(job.type(), job.priority())},
         serialize(job),
         job.id(),
         Long.toString(score(job.nextAttemptAt())));
@@ -152,7 +160,11 @@ public final class RedisJobQueue implements JobQueue {
         redis.eval(
             CLAIM,
             ScriptOutputType.VALUE,
-            new String[] {readyKey(type), leasedKey()},
+            new String[] {
+              readyKey(type, JobRecord.Priority.NORMAL),
+              leasedKey(),
+              readyKey(type, JobRecord.Priority.RETRY)
+            },
             Long.toString(now.toEpochMilli()),
             owner,
             expiry.toString(),
@@ -203,7 +215,9 @@ public final class RedisJobQueue implements JobQueue {
         redis.eval(
             FINISH,
             ScriptOutputType.INTEGER,
-            new String[] {jobKey(jobId), leasedKey(), readyKey(existing.type())},
+            new String[] {
+              jobKey(jobId), leasedKey(), readyKey(existing.type(), existing.priority())
+            },
             owner,
             status.name(),
             error == null ? "" : error,
@@ -251,8 +265,10 @@ public final class RedisJobQueue implements JobQueue {
     return namespace + "ready:";
   }
 
-  private String readyKey(JobRecord.JobType type) {
-    return readyPrefix() + type.name();
+  /** Normal jobs keep the original key, so records queued before priorities existed still claim. */
+  private String readyKey(JobRecord.JobType type, JobRecord.Priority priority) {
+    String key = readyPrefix() + type.name();
+    return priority == JobRecord.Priority.RETRY ? key + ":retry" : key;
   }
 
   private String leasedKey() {

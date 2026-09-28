@@ -3,6 +3,10 @@ package dev.notify.artifact.model;
 import java.time.Instant;
 import java.util.Map;
 
+/**
+ * @param priority claim order among ready jobs of one type: every ready {@link Priority#NORMAL}
+ *     job is claimed before any ready {@link Priority#RETRY} job
+ */
 public record JobRecord(
     String id,
     String tenantId,
@@ -16,10 +20,50 @@ public record JobRecord(
     Map<String, String> attributes,
     String lastError,
     Instant createdAt,
-    Instant updatedAt) {
+    Instant updatedAt,
+    Priority priority) {
+  public JobRecord {
+    // Records serialized before priorities existed deserialize with a null priority.
+    priority = priority == null ? Priority.NORMAL : priority;
+  }
+
+  /** A normal-priority record. */
+  public JobRecord(
+      String id,
+      String tenantId,
+      String artifactId,
+      JobType type,
+      JobStatus status,
+      int attempts,
+      Instant nextAttemptAt,
+      String leaseOwner,
+      Instant leaseExpiresAt,
+      Map<String, String> attributes,
+      String lastError,
+      Instant createdAt,
+      Instant updatedAt) {
+    this(id, tenantId, artifactId, type, status, attempts, nextAttemptAt, leaseOwner,
+        leaseExpiresAt, attributes, lastError, createdAt, updatedAt, Priority.NORMAL);
+  }
+
+  public enum Priority {
+    /** First submission of a job. */
+    NORMAL,
+    /** Re-submission by the workflow retry scheduler; yields to fresh work. */
+    RETRY
+  }
+
   public enum JobType {
     INGEST,
     STORE,
+    /** Starts an S3 multipart upload for a large artifact. */
+    STORE_INIT,
+    /** Uploads one byte range of the spooled artifact as a multipart part. */
+    STORE_PART,
+    /** Validates all parts, completes the multipart upload, and verifies the object. */
+    STORE_COMPLETE,
+    /** Deletes the local spool copy once the artifact is stored and indexed. */
+    RELEASE_SPOOL,
     FETCH,
     INDEX,
     RETRIEVAL
@@ -48,7 +92,18 @@ public record JobRecord(
         attributes,
         lastError,
         createdAt,
-        Instant.now());
+        Instant.now(),
+        priority);
+  }
+
+  /**
+   * A fresh, retry-priority copy of this job under a new id: same type, target, and attributes,
+   * with a full attempt budget. Used when a failed workflow is retried from its failed step.
+   */
+  public JobRecord retryAs(String newId, Instant now) {
+    return new JobRecord(
+        newId, tenantId, artifactId, type, JobStatus.PENDING, 0, now, null, null, attributes, null,
+        now, now, Priority.RETRY);
   }
 
   public static JobRecord pending(

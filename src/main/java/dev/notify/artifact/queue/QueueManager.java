@@ -136,7 +136,8 @@ public final class QueueManager implements AutoCloseable {
             job.attributes(),
             job.lastError(),
             job.createdAt(),
-            recoveredAt);
+            recoveredAt,
+            job.priority());
     queueFor(job.type()).requeue(recovered);
   }
 

@@ -121,9 +121,38 @@ public final class InMemoryStores {
   public static final class Vectors implements VectorStore {
     private final Map<String, ArtifactChunk> chunks = new ConcurrentHashMap<>();
 
+    /** Mirrors the SQL conflict key so re-indexing replaces a slot instead of duplicating it. */
     @Override
     public void upsert(ArtifactChunk chunk) {
-      chunks.put(key(chunk.tenantId(), chunk.id()), chunk);
+      chunks.put(slot(chunk), chunk);
+    }
+
+    @Override
+    public void deleteChunksFrom(
+        String tenantId,
+        String artifactId,
+        String embeddingModel,
+        String embeddingVersion,
+        int fromIndex) {
+      chunks
+          .values()
+          .removeIf(
+              chunk ->
+                  tenantId.equals(chunk.tenantId())
+                      && artifactId.equals(chunk.artifactId())
+                      && embeddingModel.equals(chunk.embeddingModel())
+                      && embeddingVersion.equals(chunk.embeddingVersion())
+                      && chunk.index() >= fromIndex);
+    }
+
+    private static String slot(ArtifactChunk chunk) {
+      return String.join(
+          KEY_SEPARATOR,
+          chunk.tenantId(),
+          chunk.artifactId(),
+          Integer.toString(chunk.index()),
+          chunk.embeddingModel(),
+          chunk.embeddingVersion());
     }
 
     @Override

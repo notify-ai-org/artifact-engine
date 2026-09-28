@@ -18,7 +18,7 @@ import org.junit.jupiter.api.Test;
 
 class WorkflowManagerTest {
   @Test
-  void startImmediatelyDispatchesPendingSubmittedAndRunningSteps() {
+  void startRecoversDispatchedStepsAndSubmitsOnlyReadyPendingSteps() {
     InMemoryWorkflowStore store = new InMemoryWorkflowStore();
     int workflowCount = 501;
     try (QueueManager setupQueues = new QueueManager();
@@ -41,10 +41,14 @@ class WorkflowManagerTest {
             new WorkflowManager(store, recoveredQueues, Duration.ofHours(1), failure -> {})) {
       recovered.start();
 
-      for (int index = 0; index < workflowCount * 2; index++) {
+      // Every workflow's first step is dispatched once (re-queued if it was already SUBMITTED or
+      // RUNNING, submitted if still PENDING). Second steps wait for the first to complete.
+      for (int index = 0; index < workflowCount; index++) {
         assertTrue(recoveredQueues.claim(JobRecord.JobType.STORE, "worker", Duration.ofMinutes(1),
-            Instant.now()).isPresent());
+            Instant.now()).orElseThrow().id().startsWith("first-"));
       }
+      assertTrue(recoveredQueues.claim(JobRecord.JobType.STORE, "worker", Duration.ofMinutes(1),
+          Instant.now()).isEmpty());
     }
   }
 
@@ -87,6 +91,154 @@ class WorkflowManagerTest {
       assertEquals("upload failed", failed.failureMessage());
       assertTrue(queues.claim(JobRecord.JobType.INDEX, "worker", Duration.ofMinutes(1), Instant.now()).isEmpty());
     }
+  }
+
+  @Test
+  void submitsAWholeStageTogetherAndWaitsForAllOfItBeforeTheNext() {
+    InMemoryWorkflowStore store = new InMemoryWorkflowStore();
+    try (QueueManager queues = new QueueManager();
+        WorkflowManager manager =
+            new WorkflowManager(store, queues, Duration.ofSeconds(1), failure -> {})) {
+      Workflow workflow = manager.createStaged("multipart", List.of(
+          List.of(job("init", JobRecord.JobType.STORE_INIT)),
+          List.of(job("part-1", JobRecord.JobType.STORE_PART),
+              job("part-2", JobRecord.JobType.STORE_PART),
+              job("part-3", JobRecord.JobType.STORE_PART)),
+          List.of(job("complete", JobRecord.JobType.STORE_COMPLETE))), Map.of());
+
+      manager.runOnce();
+      assertEquals(List.of("init"), drain(queues, JobRecord.JobType.STORE_INIT));
+      assertEquals(List.of(), drain(queues, JobRecord.JobType.STORE_PART));
+
+      complete(manager, "init", JobRecord.JobType.STORE_INIT);
+      manager.runOnce();
+      assertEquals(List.of("part-1", "part-2", "part-3"), drain(queues, JobRecord.JobType.STORE_PART));
+
+      complete(manager, "part-1", JobRecord.JobType.STORE_PART);
+      complete(manager, "part-3", JobRecord.JobType.STORE_PART);
+      manager.runOnce();
+      assertEquals(List.of(), drain(queues, JobRecord.JobType.STORE_COMPLETE));
+
+      complete(manager, "part-2", JobRecord.JobType.STORE_PART);
+      manager.runOnce();
+      assertEquals(List.of("complete"), drain(queues, JobRecord.JobType.STORE_COMPLETE));
+      complete(manager, "complete", JobRecord.JobType.STORE_COMPLETE);
+
+      Workflow done = store.find(workflow.id()).orElseThrow();
+      assertEquals(WorkflowStatus.COMPLETED, done.status());
+      assertEquals(List.of(0, 1, 1, 1, 2),
+          done.workflowSteps().stream().map(WorkflowStep::stage).toList());
+    }
+  }
+
+  @Test
+  void aCrashedWorkflowStaysCrashedWhenParallelSiblingsFinishAndNotifiesOnce() {
+    InMemoryWorkflowStore store = new InMemoryWorkflowStore();
+    List<String> crashed = new java.util.ArrayList<>();
+    try (QueueManager queues = new QueueManager();
+        WorkflowManager manager =
+            new WorkflowManager(store, queues, Duration.ofSeconds(1), failure -> {})) {
+      manager.addCrashListener(workflow -> crashed.add(workflow.id()));
+      Workflow workflow = manager.createStaged("multipart", List.of(
+          List.of(job("part-1", JobRecord.JobType.STORE_PART),
+              job("part-2", JobRecord.JobType.STORE_PART)),
+          List.of(job("complete", JobRecord.JobType.STORE_COMPLETE))), Map.of());
+      manager.runOnce();
+
+      manager.accept(stateChange("part-1", JobRecord.JobType.STORE_PART,
+          JobStateMachines.State.DEAD_LETTER, "part failed"));
+      complete(manager, "part-2", JobRecord.JobType.STORE_PART);
+      manager.accept(stateChange("part-1", JobRecord.JobType.STORE_PART,
+          JobStateMachines.State.DEAD_LETTER, "part failed again"));
+      manager.runOnce();
+
+      Workflow failed = store.find(workflow.id()).orElseThrow();
+      assertEquals(WorkflowStatus.CRASHED, failed.status());
+      assertEquals(WorkflowStep.WorkflowStepStatus.COMPLETED, failed.workflowSteps().get(1).status());
+      assertEquals(List.of(workflow.id()), crashed);
+      assertEquals(List.of(), drain(queues, JobRecord.JobType.STORE_COMPLETE));
+    }
+  }
+
+  @Test
+  void aStepThatFinishesBeforeItIsMarkedSubmittedKeepsItsNewerState() {
+    RacingStore store = new RacingStore(new InMemoryWorkflowStore());
+    try (QueueManager queues = new QueueManager();
+        WorkflowManager manager =
+            new WorkflowManager(store, queues, Duration.ofSeconds(1), failure -> {})) {
+      Workflow workflow = manager.create("ingest", List.of(job("store", JobRecord.JobType.STORE)));
+      // A fast worker finishes after the enqueue but before the manager writes SUBMITTED.
+      store.beforeNextUpdate = () -> complete(manager, "store", JobRecord.JobType.STORE);
+
+      manager.runOnce();
+
+      Workflow current = store.find(workflow.id()).orElseThrow();
+      assertEquals(WorkflowStep.WorkflowStepStatus.COMPLETED, current.workflowSteps().get(0).status());
+      assertEquals(WorkflowStatus.COMPLETED, current.status());
+    }
+  }
+
+  /** Runs a hook just before the next update, to interleave a worker report deterministically. */
+  private static final class RacingStore implements WorkflowStore {
+    private final WorkflowStore delegate;
+    private Runnable beforeNextUpdate;
+
+    private RacingStore(WorkflowStore delegate) {
+      this.delegate = delegate;
+    }
+
+    @Override
+    public Workflow update(String workflowId, java.util.function.UnaryOperator<Workflow> update) {
+      Runnable hook = beforeNextUpdate;
+      beforeNextUpdate = null;
+      if (hook != null) hook.run();
+      return delegate.update(workflowId, update);
+    }
+
+    @Override
+    public Workflow create(Workflow workflow) {
+      return delegate.create(workflow);
+    }
+
+    @Override
+    public java.util.Optional<Workflow> find(String workflowId) {
+      return delegate.find(workflowId);
+    }
+
+    @Override
+    public java.util.Optional<Workflow> findByJobRecordId(String jobRecordId) {
+      return delegate.findByJobRecordId(jobRecordId);
+    }
+
+    @Override
+    public List<Workflow> recoverable() {
+      return delegate.recoverable();
+    }
+
+    @Override
+    public List<Workflow> incomplete(int limit) {
+      return delegate.incomplete(limit);
+    }
+
+    @Override
+    public List<Workflow> retryCandidates(Instant now, int limit) {
+      return delegate.retryCandidates(now, limit);
+    }
+  }
+
+  private static void complete(WorkflowManager manager, String jobId, JobRecord.JobType type) {
+    manager.accept(stateChange(jobId, type, JobStateMachines.State.COMPLETED, "job completed"));
+  }
+
+  private static List<String> drain(QueueManager queues, JobRecord.JobType type) {
+    List<String> ids = new java.util.ArrayList<>();
+    for (var claimed = queues.claim(type, "worker", Duration.ofMinutes(1), Instant.now());
+        claimed.isPresent();
+        claimed = queues.claim(type, "worker", Duration.ofMinutes(1), Instant.now())) {
+      ids.add(claimed.get().id());
+    }
+    java.util.Collections.sort(ids);
+    return ids;
   }
 
   private static JobRecord job(String id, JobRecord.JobType type) {

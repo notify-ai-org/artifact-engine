@@ -2,10 +2,12 @@ package dev.notify.artifact.job;
 
 import dev.notify.artifact.EngineOptions;
 import dev.notify.artifact.auth.ArtifactAccessVerifier;
+import dev.notify.artifact.auth.AuthorizationService;
 import dev.notify.artifact.model.Artifact;
 import dev.notify.artifact.model.ArtifactStatus;
 import dev.notify.artifact.model.JobRecord;
 import dev.notify.artifact.model.Requests;
+import dev.notify.artifact.multipart.MultipartPlan;
 import dev.notify.artifact.spool.DurableSpool;
 import dev.notify.artifact.store.MetadataStore;
 import dev.notify.artifact.util.Checksum;
@@ -15,6 +17,7 @@ import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
 import dev.notify.artifact.workflow.WorkflowManager;
 
 /**
@@ -26,6 +29,9 @@ public final class IngestJob extends AbstractJob<Artifact> implements DirectJob<
   private final ArtifactAccessVerifier accessVerifier;
   private final EngineOptions options;
   private final WorkflowManager workflowManager;
+  private final AtomicBoolean claimed = new AtomicBoolean();
+  private volatile DurableSpool.SpoolEntry spoolEntry;
+  private volatile String artifactId;
 
   public IngestJob(
       Requests.Ingest request,
@@ -51,11 +57,39 @@ public final class IngestJob extends AbstractJob<Artifact> implements DirectJob<
     this.workflowManager = workflowManager;
   }
 
+  /**
+   * Authorizes, then drains the caller's stream into the spool on the calling thread. The request
+   * body is paced by the client, so this must not run on the shared direct-job pool.
+   */
+  @Override
+  public void prepare() throws IOException {
+    if (spoolEntry != null) return;
+    accessVerifier.authenticate(
+        request.principalId(), request.tenantId(), AuthorizationService.Permission.INGEST);
+    String id = UUID.randomUUID().toString();
+    spoolEntry = durableSpool.write(request.tenantId(), id, request.content(), request.metadata());
+    artifactId = id;
+  }
+
+  @Override
+  public void abandon() {
+    if (!claimed.compareAndSet(false, true) || spoolEntry == null) return;
+    try {
+      durableSpool.discard(spoolEntry.contentPath());
+    } catch (IOException ignored) {
+      // Unregistered spool entries are also reported by SpoolReconciler as orphans.
+    }
+  }
+
   @Override
   public Artifact execute() throws IOException {
-    String artifactId = UUID.randomUUID().toString();
-    DurableSpool.SpoolEntry spoolEntry =
-        durableSpool.write(request.tenantId(), artifactId, request.content(), request.metadata());
+    if (!claimed.compareAndSet(false, true)) {
+      throw new IllegalStateException("Ingest job was abandoned");
+    }
+    // Dispatchers that do not call prepare() still get the full intake.
+    prepare();
+    String artifactId = this.artifactId;
+    DurableSpool.SpoolEntry spoolEntry = this.spoolEntry;
     String detectedMediaType;
     String sanitizedFilename;
     Map<String, String> securedMetadata = new java.util.TreeMap<>(request.metadata());
@@ -116,16 +150,19 @@ public final class IngestJob extends AbstractJob<Artifact> implements DirectJob<
             now,
             now);
     try {
-      List<JobRecord> operations = initialOperations(artifact);
+      List<List<JobRecord>> stages = initialStages(artifact, options.multipartPartBytes());
       MetadataStore.Registration registration =
           metadataStore.register(
               artifact, options.deduplicateContent());
       if (registration.outcome() == MetadataStore.Registration.Outcome.CREATED
           && workflowManager != null) {
-        workflowManager.create(
+        workflowManager.createStaged(
             "ingest-store-index",
-            operations,
-            Map.of("tenantId", artifact.tenantId(), "artifactId", artifact.id()));
+            stages,
+            Map.of(
+                "tenantId", artifact.tenantId(),
+                "artifactId", artifact.id(),
+                "version", Long.toString(artifact.version())));
       }
       if (registration.outcome() != MetadataStore.Registration.Outcome.CREATED) {
         durableSpool.discard(spoolEntry.contentPath());
@@ -145,20 +182,61 @@ public final class IngestJob extends AbstractJob<Artifact> implements DirectJob<
     }
   }
 
-  private static List<JobRecord> initialOperations(Artifact artifact) {
-    return List.of(
-        JobRecord.pending(
-            operationId(artifact, JobRecord.JobType.STORE),
-            artifact.tenantId(),
-            artifact.id(),
-            JobRecord.JobType.STORE,
-            Map.of("version", Long.toString(artifact.version()))),
-        JobRecord.pending(
-            operationId(artifact, JobRecord.JobType.INDEX),
-            artifact.tenantId(),
-            artifact.id(),
-            JobRecord.JobType.INDEX,
-            Map.of("version", Long.toString(artifact.version()))));
+  /**
+   * Store, then index, then release the spool copy. An artifact larger than one part is stored as a
+   * multipart upload whose parts run in parallel: INIT, then every PART, then COMPLETE.
+   */
+  static List<List<JobRecord>> initialStages(Artifact artifact, long multipartPartBytes) {
+    String version = Long.toString(artifact.version());
+    JobRecord index = pending(artifact, JobRecord.JobType.INDEX, "", Map.of("version", version));
+    JobRecord release =
+        pending(artifact, JobRecord.JobType.RELEASE_SPOOL, "", Map.of("version", version));
+    MultipartPlan plan = MultipartPlan.forSize(artifact.sizeBytes(), multipartPartBytes);
+    if (plan == null) {
+      return List.of(
+          List.of(pending(artifact, JobRecord.JobType.STORE, "", Map.of("version", version))),
+          List.of(index),
+          List.of(release));
+    }
+    JobRecord init =
+        pending(
+            artifact,
+            JobRecord.JobType.STORE_INIT,
+            "",
+            Map.of(
+                "version", version,
+                "partSize", Long.toString(plan.partSize()),
+                "partCount", Integer.toString(plan.partCount())));
+    List<JobRecord> parts =
+        plan.parts().stream()
+            .map(
+                part ->
+                    pending(
+                        artifact,
+                        JobRecord.JobType.STORE_PART,
+                        ":" + part.number(),
+                        Map.of(
+                            "version", version,
+                            "partNumber", Integer.toString(part.number()),
+                            "offset", Long.toString(part.offset()),
+                            "length", Long.toString(part.length()))))
+            .toList();
+    JobRecord complete =
+        pending(artifact, JobRecord.JobType.STORE_COMPLETE, "", Map.of("version", version));
+    return List.of(List.of(init), parts, List.of(complete), List.of(index), List.of(release));
+  }
+
+  private static JobRecord pending(
+      Artifact artifact, JobRecord.JobType type, String suffix, Map<String, String> attributes) {
+    return JobRecord.pending(
+        // Part ids hash the part number in so they stay within the 64-character job id column.
+        suffix.isEmpty()
+            ? operationId(artifact, type)
+            : Checksum.sha256(operationId(artifact, type) + suffix),
+        artifact.tenantId(),
+        artifact.id(),
+        type,
+        attributes);
   }
 
   private static String operationId(Artifact artifact, JobRecord.JobType type) {

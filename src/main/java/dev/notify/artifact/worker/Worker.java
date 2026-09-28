@@ -381,7 +381,8 @@ public final class Worker implements AutoCloseable {
                 record.attempts(), nextAttemptAt,
                 retainLease ? record.leaseOwner() : null,
                 retainLease ? record.leaseExpiresAt() : null,
-                current.attributes(), lastError, current.createdAt(), Instant.now()));
+                current.attributes(), lastError, current.createdAt(), Instant.now(),
+                current.priority()));
   }
 
   private static boolean leaseExpired(JobRecord record, Instant now) {
@@ -441,7 +442,8 @@ public final class Worker implements AutoCloseable {
 
   private static StateMachine<JobStateMachines.State> stateMachine(JobRecord.JobType type) {
     return switch (type) {
-      case INGEST, STORE -> new JobStateMachines.Ingest();
+      case INGEST, STORE, STORE_INIT, STORE_PART, STORE_COMPLETE, RELEASE_SPOOL ->
+          new JobStateMachines.Ingest();
       case FETCH -> new JobStateMachines.Fetch();
       case INDEX -> new JobStateMachines.Index();
       case RETRIEVAL -> new JobStateMachines.Retrieval();

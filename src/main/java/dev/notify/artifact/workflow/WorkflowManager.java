@@ -18,10 +18,20 @@ import java.util.UUID;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.Set;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Collectors;
 import java.util.function.Consumer;
 
-/** Persists sequential workflows, submits ready steps, and resumes incomplete workflows. */
+/**
+ * Persists staged workflows, submits ready steps, and resumes incomplete workflows.
+ *
+ * <p>Steps are grouped into stages. Every step of a stage is submitted together, so they run in
+ * parallel; the next stage starts once all of them have completed. A workflow crashes when any
+ * step dead-letters, and stays crashed even if parallel siblings complete afterwards.
+ */
 public final class WorkflowManager implements AutoCloseable, Consumer<Worker.StateChange> {
   private static final int RECOVERY_BATCH = 500;
   private final WorkflowStore store;
@@ -31,6 +41,7 @@ public final class WorkflowManager implements AutoCloseable, Consumer<Worker.Sta
   private final WorkerManager workerManager;
   private final AtomicBoolean started = new AtomicBoolean();
   private final ScheduledExecutorService scheduler;
+  private final List<Consumer<Workflow>> crashListeners = new CopyOnWriteArrayList<>();
 
   public WorkflowManager(
       WorkflowStore store,
@@ -69,21 +80,40 @@ public final class WorkflowManager implements AutoCloseable, Consumer<Worker.Sta
     return create(name, jobs, Map.of());
   }
 
+  /** Creates a linear workflow: each job runs after the previous one completes. */
   public Workflow create(String name, List<JobRecord> jobs, Map<String, String> attributes) {
+    return createStaged(
+        name, List.copyOf(jobs).stream().map(List::of).toList(), attributes);
+  }
+
+  /**
+   * Creates a staged workflow. Jobs within a stage run in parallel; each stage starts once every
+   * job of the previous stage has completed.
+   */
+  public Workflow createStaged(
+      String name, List<List<JobRecord>> stages, Map<String, String> attributes) {
     if (name == null || name.isBlank()) throw new IllegalArgumentException("name is required");
-    List<JobRecord> records = List.copyOf(jobs);
-    if (records.isEmpty()) throw new IllegalArgumentException("workflow requires at least one job");
+    List<List<JobRecord>> plan = List.copyOf(stages).stream().map(List::copyOf).toList();
+    if (plan.isEmpty() || plan.stream().anyMatch(List::isEmpty)) {
+      throw new IllegalArgumentException("workflow stages must be non-empty");
+    }
     String workflowId = UUID.randomUUID().toString();
     Instant now = Instant.now();
-    List<String> ids = records.stream().map(ignored -> UUID.randomUUID().toString()).toList();
-    List<WorkflowStep> steps = new ArrayList<>();
-    for (int index = 0; index < records.size(); index++) {
-      JobRecord job = records.get(index);
-      steps.add(
-          new WorkflowStep(
-              ids.get(index), workflowId, now, now, job.id(), job, WorkflowStepStatus.PENDING,
-              null, null, index == 0 ? null : ids.get(index - 1),
-              index + 1 == ids.size() ? null : ids.get(index + 1), index, Map.of(), null));
+    int total = plan.stream().mapToInt(List::size).sum();
+    List<String> ids = new ArrayList<>(total);
+    for (int index = 0; index < total; index++) ids.add(UUID.randomUUID().toString());
+    List<WorkflowStep> steps = new ArrayList<>(total);
+    int sequence = 0;
+    for (int stage = 0; stage < plan.size(); stage++) {
+      for (JobRecord job : plan.get(stage)) {
+        steps.add(
+            new WorkflowStep(
+                ids.get(sequence), workflowId, now, now, job.id(), job, WorkflowStepStatus.PENDING,
+                null, null, sequence == 0 ? null : ids.get(sequence - 1),
+                sequence + 1 == total ? null : ids.get(sequence + 1), sequence, Map.of(), null,
+                stage));
+        sequence++;
+      }
     }
     Workflow workflow =
         new Workflow(
@@ -94,6 +124,11 @@ public final class WorkflowManager implements AutoCloseable, Consumer<Worker.Sta
     return persisted;
   }
 
+  /** Called once for each workflow that transitions to {@link WorkflowStatus#CRASHED}. */
+  public void addCrashListener(Consumer<Workflow> listener) {
+    crashListeners.add(Objects.requireNonNull(listener, "listener"));
+  }
+
   public void start() {
     if (!started.compareAndSet(false, true)) return;
     safeRecover();
@@ -102,7 +137,7 @@ public final class WorkflowManager implements AutoCloseable, Consumer<Worker.Sta
   }
 
   public void runOnce() {
-    for (Workflow workflow : store.incomplete(RECOVERY_BATCH)) submitReadyStep(workflow);
+    for (Workflow workflow : store.incomplete(RECOVERY_BATCH)) submitReadySteps(workflow);
   }
 
   @Override
@@ -118,30 +153,57 @@ public final class WorkflowManager implements AutoCloseable, Consumer<Worker.Sta
     store
         .findByJobRecordId(jobRecordId)
         .ifPresent(
-            workflow ->
-                store.update(
-                    workflow.id(),
-                    current -> apply(current, jobRecordId, state, failureMessage)));
+            workflow -> {
+              AtomicReference<WorkflowStatus> before = new AtomicReference<>();
+              Workflow updated =
+                  store.update(
+                      workflow.id(),
+                      current -> {
+                        before.set(current.status());
+                        return apply(current, jobRecordId, state, failureMessage);
+                      });
+              if (updated.status() == WorkflowStatus.CRASHED
+                  && before.get() != WorkflowStatus.CRASHED) {
+                notifyCrashed(updated);
+              }
+            });
     wakeUp();
   }
 
-  private void submitReadyStep(Workflow workflow) {
-    WorkflowStep ready = workflow.workflowSteps().stream()
+  private void submitReadySteps(Workflow workflow) {
+    List<WorkflowStep> ready = workflow.workflowSteps().stream()
         .filter(step -> step.status() == WorkflowStepStatus.PENDING)
-        .filter(step -> step.prevStepId() == null || completed(workflow, step.prevStepId()))
-        .findFirst()
-        .orElse(null);
-    if (ready == null) return;
-    queues.enqueue(ready.jobRecord());
+        .filter(step -> earlierStagesCompleted(workflow, step.stage()))
+        .toList();
+    if (ready.isEmpty()) return;
+    // Enqueue first: a crash before the status write is repaired by recovery re-queuing
+    // PENDING steps, and every job tolerates at-least-once delivery.
+    ready.forEach(step -> queues.enqueue(step.jobRecord()));
+    Set<String> readyIds = ready.stream().map(WorkflowStep::id).collect(Collectors.toSet());
     Instant now = Instant.now();
-    store.update(workflow.id(), current -> replaceStep(current, ready.id(),
-        step -> copyStep(step, WorkflowStepStatus.SUBMITTED, now, null, null),
-        WorkflowStatus.RUNNING, current.processStartAt() == null ? now : current.processStartAt(), null));
+    store.update(workflow.id(), current -> markSubmitted(current, readyIds, now));
   }
 
-  private static boolean completed(Workflow workflow, String stepId) {
+  /**
+   * Only PENDING steps become SUBMITTED. A fast job may already have reported RUNNING or COMPLETED
+   * between the enqueue and this write, and that newer state must not be overwritten.
+   */
+  private static Workflow markSubmitted(Workflow workflow, Set<String> stepIds, Instant now) {
+    List<WorkflowStep> steps = workflow.workflowSteps().stream()
+        .map(step -> stepIds.contains(step.id()) && step.status() == WorkflowStepStatus.PENDING
+            ? copyStep(step, WorkflowStepStatus.SUBMITTED, now, null, null) : step).toList();
+    WorkflowStatus status =
+        workflow.status() == WorkflowStatus.PENDING ? WorkflowStatus.RUNNING : workflow.status();
+    return new Workflow(workflow.id(), workflow.name(), workflow.createdAt(), Instant.now(), status,
+        workflow.processStartAt() == null ? now : workflow.processStartAt(),
+        workflow.processEndAt(), steps, workflow.attributes(), workflow.failureMessage(),
+        workflow.retryAttempts(), workflow.nextRetryAt());
+  }
+
+  private static boolean earlierStagesCompleted(Workflow workflow, int stage) {
     return workflow.workflowSteps().stream()
-        .anyMatch(step -> step.id().equals(stepId) && step.status() == WorkflowStepStatus.COMPLETED);
+        .filter(step -> step.stage() < stage)
+        .allMatch(step -> step.status() == WorkflowStepStatus.COMPLETED);
   }
 
   private static Workflow apply(
@@ -160,19 +222,28 @@ public final class WorkflowManager implements AutoCloseable, Consumer<Worker.Sta
       case COMPLETED -> WorkflowStepStatus.COMPLETED;
       case DEAD_LETTER -> WorkflowStepStatus.CRASHED;
     };
-    boolean crashed = state == JobStateMachines.State.DEAD_LETTER;
-    boolean completed = state == JobStateMachines.State.COMPLETED
+    boolean stepCrashed = state == JobStateMachines.State.DEAD_LETTER;
+    // Parallel siblings keep reporting after a crash; their step rows update, but a crashed or
+    // dead-lettered workflow keeps its status until the retry scheduler acts on it.
+    boolean alreadyFailed = workflow.status() == WorkflowStatus.CRASHED
+        || workflow.status() == WorkflowStatus.DEAD_LETTERED;
+    boolean crashed = alreadyFailed || stepCrashed;
+    boolean completed = !crashed
+        && state == JobStateMachines.State.COMPLETED
         && workflow.workflowSteps().stream()
             .allMatch(step -> step.id().equals(target.id()) || step.status() == WorkflowStepStatus.COMPLETED);
+    WorkflowStatus status = alreadyFailed
+        ? workflow.status()
+        : crashed ? WorkflowStatus.CRASHED : completed ? WorkflowStatus.COMPLETED : WorkflowStatus.RUNNING;
     return replaceStep(
         workflow,
         target.id(),
         step -> copyStep(step, stepStatus,
             step.processStartAt() == null ? now : step.processStartAt(),
-            state == JobStateMachines.State.COMPLETED || crashed ? now : null, failureMessage),
-        crashed ? WorkflowStatus.CRASHED : completed ? WorkflowStatus.COMPLETED : WorkflowStatus.RUNNING,
+            state == JobStateMachines.State.COMPLETED || stepCrashed ? now : null, failureMessage),
+        status,
         workflow.processStartAt() == null ? now : workflow.processStartAt(),
-        crashed || completed ? now : null);
+        alreadyFailed ? workflow.processEndAt() : crashed || completed ? now : null);
   }
 
   private static Workflow replaceStep(
@@ -187,14 +258,25 @@ public final class WorkflowManager implements AutoCloseable, Consumer<Worker.Sta
     String failure = steps.stream().filter(step -> step.status() == WorkflowStepStatus.CRASHED)
         .map(WorkflowStep::failureMessage).filter(Objects::nonNull).findFirst().orElse(null);
     return new Workflow(workflow.id(), workflow.name(), workflow.createdAt(), Instant.now(), status,
-        startedAt, endedAt, steps, workflow.attributes(), failure);
+        startedAt, endedAt, steps, workflow.attributes(), failure, workflow.retryAttempts(),
+        workflow.nextRetryAt());
   }
 
   private static WorkflowStep copyStep(
       WorkflowStep step, WorkflowStepStatus status, Instant startedAt, Instant endedAt, String failure) {
     return new WorkflowStep(step.id(), step.workflowId(), step.createdAt(), Instant.now(),
         step.jobRecordId(), step.jobRecord(), status, startedAt, endedAt, step.prevStepId(),
-        step.nextStepId(), step.sequence(), step.attributes(), failure);
+        step.nextStepId(), step.sequence(), step.attributes(), failure, step.stage());
+  }
+
+  private void notifyCrashed(Workflow workflow) {
+    for (Consumer<Workflow> listener : crashListeners) {
+      try {
+        listener.accept(workflow);
+      } catch (Throwable failure) {
+        failureHandler.accept(failure);
+      }
+    }
   }
 
   private void safeDispatch() {
@@ -213,15 +295,24 @@ public final class WorkflowManager implements AutoCloseable, Consumer<Worker.Sta
     }
   }
 
+  /**
+   * Re-queues steps that were already dispatched before a restart, then submits PENDING steps
+   * through the normal stage-aware path so a later stage never starts before an earlier one ends.
+   */
   private void dispatchPendingSteps(Workflow workflow) {
     Instant now = Instant.now();
     for (WorkflowStep step : workflow.workflowSteps()) {
-      if (step.status() == WorkflowStepStatus.PENDING
-          || step.status() == WorkflowStepStatus.SUBMITTED
+      if (step.status() == WorkflowStepStatus.SUBMITTED
           || step.status() == WorkflowStepStatus.RUNNING) {
         queues.requeue(step.jobRecord(), now);
       }
     }
+    submitReadySteps(workflow);
+  }
+
+  /** Submits ready steps now instead of at the next poll, e.g. after a workflow was resumed. */
+  public void dispatchNow() {
+    wakeUp();
   }
 
   private void wakeUp() {

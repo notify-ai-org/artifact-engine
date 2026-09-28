@@ -1,6 +1,8 @@
 package dev.notify.artifact.workflow;
 
+import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.NoSuchElementException;
@@ -33,21 +35,28 @@ public final class InMemoryWorkflowStore implements WorkflowStore {
 
   @Override
   public synchronized List<Workflow> recoverable() {
-    return workflows.values().stream()
-        .filter(workflow -> workflow.status() == WorkflowStatus.PENDING
-            || workflow.status() == WorkflowStatus.RUNNING)
-        .toList();
+    return workflows.values().stream().filter(InMemoryWorkflowStore::active).toList();
   }
 
   @Override
   public synchronized List<Workflow> incomplete(int limit) {
     List<Workflow> result = new ArrayList<>();
     for (Workflow workflow : workflows.values()) {
-      if (workflow.status() != WorkflowStatus.COMPLETED
-          && workflow.status() != WorkflowStatus.CRASHED) result.add(workflow);
+      if (active(workflow)) result.add(workflow);
       if (result.size() == limit) break;
     }
     return List.copyOf(result);
+  }
+
+  @Override
+  public synchronized List<Workflow> retryCandidates(Instant now, int limit) {
+    return workflows.values().stream()
+        .filter(workflow -> workflow.status() == WorkflowStatus.CRASHED)
+        .filter(workflow -> workflow.nextRetryAt() == null || !workflow.nextRetryAt().isAfter(now))
+        .sorted(Comparator.comparing(
+            Workflow::nextRetryAt, Comparator.nullsFirst(Comparator.naturalOrder())))
+        .limit(Math.max(0, limit))
+        .toList();
   }
 
   @Override
@@ -57,5 +66,10 @@ public final class InMemoryWorkflowStore implements WorkflowStore {
     Workflow changed = java.util.Objects.requireNonNull(update.apply(current));
     workflows.put(workflowId, changed);
     return changed;
+  }
+
+  private static boolean active(Workflow workflow) {
+    return workflow.status() == WorkflowStatus.PENDING
+        || workflow.status() == WorkflowStatus.RUNNING;
   }
 }

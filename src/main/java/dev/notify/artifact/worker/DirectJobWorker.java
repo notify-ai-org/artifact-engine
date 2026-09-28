@@ -6,6 +6,7 @@ import java.util.Objects;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.FutureTask;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 
@@ -32,12 +33,19 @@ public final class DirectJobWorker implements AutoCloseable {
 
   public <R> R execute(DirectJob<R> job) throws Exception {
     Objects.requireNonNull(job, "job");
+    job.prepare();
     FutureTask<R> task = new FutureTask<>(job::execute);
-    executor.execute(task);
+    try {
+      executor.execute(task);
+    } catch (RejectedExecutionException rejected) {
+      job.abandon();
+      throw rejected;
+    }
     try {
       return task.get();
     } catch (InterruptedException interrupted) {
       task.cancel(true);
+      job.abandon();
       Thread.currentThread().interrupt();
       throw interrupted;
     } catch (ExecutionException failed) {

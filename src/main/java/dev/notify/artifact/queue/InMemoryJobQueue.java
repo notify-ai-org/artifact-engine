@@ -31,6 +31,8 @@ public final class InMemoryJobQueue implements JobQueue {
 
   public synchronized Optional<JobRecord> claim(
       JobRecord.JobType type, String owner, Duration lease, Instant now) {
+    // Fresh work first: a retry-priority job is claimed only when no normal job is ready.
+    // Stream.min keeps the first of equal elements, so FIFO order holds within a priority.
     Optional<JobRecord> ready =
         readyJobs.values().stream()
             .filter(
@@ -39,7 +41,7 @@ public final class InMemoryJobQueue implements JobQueue {
                         && (j.status() == JobRecord.JobStatus.PENDING
                             || j.status() == JobRecord.JobStatus.RETRY_PENDING)
                         && (j.nextAttemptAt() == null || !j.nextAttemptAt().isAfter(now)))
-            .findFirst();
+            .min(java.util.Comparator.comparing(JobRecord::priority));
     if (ready.isEmpty()) {
       return Optional.empty();
     }
@@ -87,7 +89,8 @@ public final class InMemoryJobQueue implements JobQueue {
               j.attributes(),
               error,
               j.createdAt(),
-              Instant.now()));
+              Instant.now(),
+              j.priority()));
     }
     return true;
   }
@@ -113,7 +116,8 @@ public final class InMemoryJobQueue implements JobQueue {
                 j.attributes(),
                 "lease expired",
                 j.createdAt(),
-                now));
+                now,
+                j.priority()));
         count++;
       }
     }

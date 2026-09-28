@@ -11,6 +11,8 @@ import dev.notify.artifact.queue.QueueManager;
 import dev.notify.artifact.store.InMemoryJobStore;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.junit.jupiter.api.Test;
@@ -133,6 +135,55 @@ class QueuingJobDispatcherTest {
           IllegalArgumentException.class,
           () -> dispatcher.dispatch(queueable(claimed, "accepted", new AtomicBoolean())));
     }
+  }
+
+  @Test
+  void preparesBeforeEnqueueingAndAbandonsWhenTheEnqueueFails() throws Exception {
+    List<String> events = new ArrayList<>();
+    JobRecord running =
+        new JobRecord(
+            "not-pending", "tenant-a", "artifact-a", JobRecord.JobType.INDEX,
+            JobRecord.JobStatus.RUNNING, 0, Instant.now(), null, null, Map.of(), null,
+            Instant.now(), Instant.now());
+
+    try (QueueManager queueManager = new QueueManager()) {
+      QueuingJobDispatcher dispatcher = new QueuingJobDispatcher(queueManager);
+
+      assertThrows(
+          IllegalArgumentException.class, () -> dispatcher.dispatch(lifecycle(running, events)));
+    }
+
+    assertEquals(List.of("prepare", "queueRecord", "abandon"), events);
+  }
+
+  private static QueueableJob<String> lifecycle(JobRecord record, List<String> events) {
+    return new QueueableJob<>() {
+      @Override
+      public void prepare() {
+        events.add("prepare");
+      }
+
+      @Override
+      public void abandon() {
+        events.add("abandon");
+      }
+
+      @Override
+      public JobRecord queueRecord() {
+        events.add("queueRecord");
+        return record;
+      }
+
+      @Override
+      public String queuedResult() {
+        return "accepted";
+      }
+
+      @Override
+      public String execute() {
+        return "executed";
+      }
+    };
   }
 
   private static QueueableJob<String> queueable(

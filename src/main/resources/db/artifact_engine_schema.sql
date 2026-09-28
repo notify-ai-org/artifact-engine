@@ -87,11 +87,15 @@ CREATE TABLE artifact_workflow (
     process_start_at TIMESTAMPTZ,
     process_end_at TIMESTAMPTZ,
     attributes_json TEXT NOT NULL,
-    failure_message TEXT
+    failure_message TEXT,
+    retry_attempts INTEGER NOT NULL DEFAULT 0,
+    next_retry_at TIMESTAMPTZ
 );
 
 CREATE INDEX ix_artifact_workflow_status_created
     ON artifact_workflow (status, created_at);
+CREATE INDEX ix_artifact_workflow_retry
+    ON artifact_workflow (status, next_retry_at);
 
 CREATE TABLE artifact_job (
     id VARCHAR(64) PRIMARY KEY,
@@ -106,7 +110,8 @@ CREATE TABLE artifact_job (
     attributes_json TEXT NOT NULL,
     last_error TEXT,
     created_at TIMESTAMPTZ NOT NULL,
-    updated_at TIMESTAMPTZ NOT NULL
+    updated_at TIMESTAMPTZ NOT NULL,
+    priority VARCHAR(16) NOT NULL DEFAULT 'NORMAL'
 );
 
 CREATE INDEX ix_artifact_job_status_next_attempt
@@ -119,6 +124,7 @@ CREATE TABLE artifact_workflow_step (
     workflow_id VARCHAR(36) NOT NULL,
     job_record_id VARCHAR(64) NOT NULL UNIQUE,
     step_order INTEGER NOT NULL,
+    stage INTEGER NOT NULL,
     created_at TIMESTAMPTZ NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL,
     status VARCHAR(32) NOT NULL,
@@ -137,3 +143,18 @@ CREATE TABLE artifact_workflow_step (
 
 CREATE INDEX ix_artifact_workflow_step_workflow
     ON artifact_workflow_step (workflow_id, step_order);
+CREATE INDEX ix_artifact_workflow_step_stage
+    ON artifact_workflow_step (workflow_id, stage);
+
+CREATE TABLE artifact_multipart_upload (
+    tenant_id VARCHAR(128) NOT NULL,
+    artifact_id VARCHAR(64) NOT NULL,
+    version BIGINT NOT NULL,
+    storage_key VARCHAR(1024) NOT NULL,
+    upload_id VARCHAR(1024) NOT NULL,
+    part_size BIGINT NOT NULL,
+    part_count INTEGER NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL,
+    composite_sha256 VARCHAR(64),
+    PRIMARY KEY (tenant_id, artifact_id, version)
+);

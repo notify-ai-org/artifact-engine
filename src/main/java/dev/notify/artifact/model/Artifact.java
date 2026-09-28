@@ -60,6 +60,31 @@ public record Artifact(
         Instant.now());
   }
 
+  /** The local spool copy was released; the object store holds the only copy from now on. */
+  public Artifact withoutSpool() {
+    return new Artifact(
+        id,
+        tenantId,
+        idempotencyKey,
+        idempotencyFingerprint,
+        sourceType,
+        sourceUri,
+        originalName,
+        mediaType,
+        sizeBytes,
+        sha256,
+        storageKey,
+        null,
+        storageStatus,
+        indexStatus,
+        version,
+        metadata,
+        failureCode,
+        failureMessage,
+        createdAt,
+        Instant.now());
+  }
+
   public Artifact withIndex(ArtifactStatus.Index status) {
     return new Artifact(
         id,

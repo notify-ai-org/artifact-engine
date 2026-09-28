@@ -1,9 +1,11 @@
 package dev.notify.artifact.extract;
 
 import java.io.IOException;
-import java.io.InputStream;
+import java.nio.file.Path;
 import org.commonmark.parser.Parser;
 import org.commonmark.renderer.text.TextContentRenderer;
+
+import dev.notify.artifact.util.TextSink;
 
 /** Converts CommonMark content to readable plain text. */
 public final class MarkdownTextExtractor implements TextExtractor {
@@ -24,9 +26,10 @@ public final class MarkdownTextExtractor implements TextExtractor {
   }
 
   @Override
-  public String extract(InputStream content) throws IOException {
-    String markdown = BoundedContent.utf8(content, maxInputBytes);
-    return BoundedContent.text(RENDERER.render(PARSER.parse(markdown)), maxCharacters);
+  public void extract(Path file, TextSink sink) throws IOException {
+    // CommonMark needs the whole AST; the byte bound keeps that in check.
+    String markdown = BoundedContent.utf8(file, maxInputBytes);
+    BoundedContent.limit(sink, maxCharacters).accept(RENDERER.render(PARSER.parse(markdown)));
   }
 
   private static int positive(int value, String name) {

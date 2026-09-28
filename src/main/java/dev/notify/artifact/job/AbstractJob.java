@@ -6,9 +6,10 @@ import dev.notify.artifact.auth.ArtifactAccessVerifier;
 import dev.notify.artifact.auth.AuthorizationService;
 import dev.notify.artifact.model.Artifact;
 import dev.notify.artifact.model.ArtifactStatus;
+import dev.notify.artifact.model.JobRecord;
 import dev.notify.artifact.store.MetadataStore;
 
-abstract class AbstractJob<R> implements Job<R> {
+public abstract class AbstractJob<R> implements Job<R> {
 
     protected final ArtifactAccessVerifier verifier;
 
@@ -51,5 +52,28 @@ abstract class AbstractJob<R> implements Job<R> {
         verifier.verifyArtifact(tenantId, artifact);
         return verifier.verifyExtractedContent(artifact, extractedContent);
     }
+
+     static long version(JobRecord record) {
+    return longAttribute(record, "version");
+  }
+
+  static long longAttribute(JobRecord record, String name) {
+    String value = record.attributes().get(name);
+    if (value == null) {
+      throw new IllegalArgumentException("Job " + record.id() + " is missing attribute " + name);
+    }
+    return Long.parseLong(value);
+  }
+
+  /** The workflow was planned for one artifact version; a newer version gets its own workflow. */
+  static Artifact artifactAtVersion(AbstractJob<?> job, JobRecord record, long version) {
+    Artifact artifact = job.required(record.tenantId(), record.artifactId());
+    if (artifact.version() != version) {
+      throw new IllegalStateException(
+          "Artifact " + record.artifactId() + " moved from version " + version + " to "
+              + artifact.version());
+    }
+    return artifact;
+  }
     
 }

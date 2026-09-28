@@ -1,12 +1,18 @@
 package dev.notify.artifact.extract;
 
 import java.io.IOException;
-import java.io.InputStream;
+import java.nio.file.Path;
 import org.apache.pdfbox.Loader;
+import org.apache.pdfbox.io.IOUtils;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.text.PDFTextStripper;
 
-/** Extracts embedded text from a bounded PDF document. */
+import dev.notify.artifact.util.TextSink;
+
+/**
+ * Streams embedded PDF text page by page. The document is read from disk with a temp-file-only
+ * scratch cache, so heap use is bounded by the largest page rather than the file size.
+ */
 public final class PdfTextExtractor implements TextExtractor {
   private final int maxInputBytes;
   private final int maxCharacters;
@@ -22,10 +28,18 @@ public final class PdfTextExtractor implements TextExtractor {
   }
 
   @Override
-  public String extract(InputStream content) throws IOException {
-    byte[] pdf = BoundedContent.bytes(content, maxInputBytes);
-    try (PDDocument document = Loader.loadPDF(pdf)) {
-      return BoundedContent.text(new PDFTextStripper().getText(document), maxCharacters);
+  public void extract(Path file, TextSink sink) throws IOException {
+    BoundedContent.requireSize(file, maxInputBytes);
+    TextSink bounded = BoundedContent.limit(sink, maxCharacters);
+    try (PDDocument document =
+        Loader.loadPDF(file.toFile(), IOUtils.createTempFileOnlyStreamCache())) {
+      PDFTextStripper stripper = new PDFTextStripper();
+      for (int page = 1, pages = document.getNumberOfPages(); page <= pages; page++) {
+        stripper.setStartPage(page);
+        stripper.setEndPage(page);
+        String text = stripper.getText(document);
+        if (!text.isEmpty()) bounded.accept(text);
+      }
     }
   }
 

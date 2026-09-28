@@ -31,17 +31,23 @@ public final class QueuingJobDispatcher implements JobDispatcher {
   @Override
   public <R> R dispatch(Job<R> job) throws Exception {
     Objects.requireNonNull(job, "job");
+    job.prepare();
     if (!(job instanceof QueueableJob<?>)) {
       return job.execute();
     }
 
     @SuppressWarnings("unchecked")
     QueueableJob<R> queueableJob = (QueueableJob<R>) job;
-    JobRecord record = requirePending(queueableJob.queueRecord());
-    if (jobStore != null) {
-      jobStore.create(record);
+    try {
+      JobRecord record = requirePending(queueableJob.queueRecord());
+      if (jobStore != null) {
+        jobStore.create(record);
+      }
+      queueManager.enqueue(record);
+    } catch (Exception | Error enqueueFailure) {
+      job.abandon();
+      throw enqueueFailure;
     }
-    queueManager.enqueue(record);
     return queueableJob.queuedResult();
   }
 

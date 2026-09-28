@@ -45,9 +45,10 @@ public final class JdbiWorkflowStore implements WorkflowStore {
                   """
                   INSERT INTO artifact_workflow
                     (id, name, status, created_at, updated_at, process_start_at,
-                     process_end_at, attributes_json, failure_message)
+                     process_end_at, attributes_json, failure_message, retry_attempts,
+                     next_retry_at)
                   VALUES (:id, :name, :status, :createdAt, :updatedAt, :startAt, :endAt,
-                          :attributesJson, :failureMessage)
+                          :attributesJson, :failureMessage, :retryAttempts, :nextRetryAt)
                   """)
               .bind("id", workflow.id()).bind("name", workflow.name())
               .bind("status", workflow.status().name()).bind("createdAt", workflow.createdAt())
@@ -55,8 +56,10 @@ public final class JdbiWorkflowStore implements WorkflowStore {
               .bind("endAt", workflow.processEndAt())
               .bind("attributesJson", serializeValue(workflow.attributes(), "Workflow attributes"))
               .bind("failureMessage", workflow.failureMessage())
+              .bind("retryAttempts", workflow.retryAttempts())
+              .bind("nextRetryAt", workflow.nextRetryAt())
               .execute();
-          replaceSteps(handle, workflow);
+          insertSteps(handle, workflow.id(), workflow.workflowSteps());
         });
     return workflow;
   }
@@ -119,6 +122,28 @@ public final class JdbiWorkflowStore implements WorkflowStore {
   }
 
   @Override
+  public List<Workflow> retryCandidates(Instant now, int limit) {
+    return jdbi.withHandle(
+        handle -> {
+          List<Workflow> workflows =
+              handle
+                  .createQuery(
+                      """
+                      SELECT * FROM artifact_workflow
+                      WHERE status = 'CRASHED'
+                        AND (next_retry_at IS NULL OR next_retry_at <= :now)
+                      ORDER BY next_retry_at NULLS FIRST, updated_at
+                      LIMIT :limit
+                      """)
+                  .bind("now", now)
+                  .bind("limit", Math.max(1, Math.min(limit, 1000)))
+                  .map((resultSet, context) -> mapWorkflow(resultSet))
+                  .list();
+          return workflows.stream().map(workflow -> withStoredSteps(handle, workflow)).toList();
+        });
+  }
+
+  @Override
   public Workflow update(String workflowId, UnaryOperator<Workflow> update) {
     return jdbi.inTransaction(handle -> {
       Workflow current = find(handle, workflowId, true)
@@ -131,7 +156,8 @@ public final class JdbiWorkflowStore implements WorkflowStore {
               """
               UPDATE artifact_workflow SET name = :name, status = :status, updated_at = :updatedAt,
                 process_start_at = :startAt, process_end_at = :endAt,
-                attributes_json = :attributesJson, failure_message = :failureMessage
+                attributes_json = :attributesJson, failure_message = :failureMessage,
+                retry_attempts = :retryAttempts, next_retry_at = :nextRetryAt
               WHERE id = :id
               """)
           .bind("id", changed.id()).bind("name", changed.name())
@@ -140,8 +166,10 @@ public final class JdbiWorkflowStore implements WorkflowStore {
           .bind("endAt", changed.processEndAt())
           .bind("attributesJson", serializeValue(changed.attributes(), "Workflow attributes"))
           .bind("failureMessage", changed.failureMessage())
+          .bind("retryAttempts", changed.retryAttempts())
+          .bind("nextRetryAt", changed.nextRetryAt())
           .execute();
-      replaceSteps(handle, changed);
+      syncSteps(handle, current, changed);
       return changed;
     });
   }
@@ -169,7 +197,9 @@ public final class JdbiWorkflowStore implements WorkflowStore {
         deserializeValue(
             resultSet.getString("attributes_json"), new TypeReference<Map<String, String>>() {},
             "workflow attributes"),
-        resultSet.getString("failure_message"));
+        resultSet.getString("failure_message"),
+        resultSet.getInt("retry_attempts"),
+        instant(resultSet, "next_retry_at"));
   }
 
   private Workflow withStoredSteps(Handle handle, Workflow workflow) {
@@ -186,7 +216,8 @@ public final class JdbiWorkflowStore implements WorkflowStore {
                        j.lease_expires_at AS job_lease_expires_at,
                        j.attributes_json AS job_attributes_json,
                        j.last_error AS job_last_error,
-                       j.created_at AS job_created_at, j.updated_at AS job_updated_at
+                       j.created_at AS job_created_at, j.updated_at AS job_updated_at,
+                       j.priority AS job_priority
                 FROM artifact_workflow_step s
                 JOIN artifact_job j ON j.id = s.job_record_id
                 WHERE s.workflow_id = :workflowId ORDER BY s.step_order
@@ -217,7 +248,8 @@ public final class JdbiWorkflowStore implements WorkflowStore {
         deserializeValue(
             resultSet.getString("attributes_json"), new TypeReference<Map<String, String>>() {},
             "step attributes"),
-        resultSet.getString("failure_message"));
+        resultSet.getString("failure_message"),
+        resultSet.getInt("stage"));
   }
 
   private static Instant instant(ResultSet resultSet, String column) throws SQLException {
@@ -225,47 +257,97 @@ public final class JdbiWorkflowStore implements WorkflowStore {
     return timestamp == null ? null : timestamp.toInstant();
   }
 
-  /** Keeps job records and workflow-step references consistent in one transaction. */
-  private void replaceSteps(Handle handle, Workflow workflow) {
-    handle.createUpdate("DELETE FROM artifact_workflow_step WHERE workflow_id = :workflowId")
-        .bind("workflowId", workflow.id())
-        .execute();
+  /**
+   * Writes only what an update changed. A state transition touches one step, so rewriting every
+   * step (and re-upserting every job) per update would cost O(steps) writes each time, and O(steps²)
+   * over a wide fan-out workflow.
+   */
+  private void syncSteps(Handle handle, Workflow current, Workflow changed) {
+    Map<String, WorkflowStep> before = new java.util.HashMap<>();
+    current.workflowSteps().forEach(step -> before.put(step.id(), step));
+    java.util.Set<String> kept = new java.util.HashSet<>();
+    List<WorkflowStep> added = new java.util.ArrayList<>();
+    List<WorkflowStep> modified = new java.util.ArrayList<>();
+    for (WorkflowStep step : changed.workflowSteps()) {
+      WorkflowStep previous = before.get(step.id());
+      if (previous == null) {
+        added.add(step);
+      } else {
+        kept.add(step.id());
+        if (!previous.equals(step)) modified.add(step);
+      }
+    }
+    List<String> removed =
+        before.keySet().stream().filter(id -> !kept.contains(id)).toList();
 
-    workflow.workflowSteps().forEach(step -> jobs.create(handle, step.jobRecord()));
+    if (!removed.isEmpty()) {
+      handle.createUpdate("DELETE FROM artifact_workflow_step WHERE id IN (<ids>)")
+          .bindList("ids", removed)
+          .execute();
+    }
+    if (!modified.isEmpty()) {
+      // A retried step points at a fresh job record; its row must exist before the step moves.
+      for (WorkflowStep step : modified) {
+        if (!step.jobRecordId().equals(before.get(step.id()).jobRecordId())) {
+          jobs.create(handle, step.jobRecord());
+        }
+      }
+      var batch = handle.prepareBatch(
+          """
+          UPDATE artifact_workflow_step SET
+            updated_at = :updatedAt, job_record_id = :jobId, status = :status,
+            process_start_at = :startAt, process_end_at = :endAt, prev_step_id = :prevStepId,
+            next_step_id = :nextStepId, step_order = :stepOrder, stage = :stage,
+            attributes_json = :attributesJson, failure_message = :failureMessage
+          WHERE id = :id AND workflow_id = :workflowId
+          """);
+      modified.forEach(step -> bindStep(batch, changed.id(), step).add());
+      batch.execute();
+    }
+    if (!added.isEmpty()) {
+      insertSteps(handle, changed.id(), added);
+    }
+  }
+
+  /** Keeps job records and workflow-step references consistent in one transaction. */
+  private void insertSteps(Handle handle, String workflowId, List<WorkflowStep> steps) {
+    steps.forEach(step -> jobs.create(handle, step.jobRecord()));
 
     var batch = handle.prepareBatch(
         """
         INSERT INTO artifact_workflow_step
           (id, workflow_id, created_at, updated_at, job_record_id,
            status, process_start_at, process_end_at, prev_step_id, next_step_id,
-           step_order, attributes_json, failure_message)
+           step_order, stage, attributes_json, failure_message)
         VALUES
           (:id, :workflowId, :createdAt, :updatedAt, :jobId,
            :status, :startAt, :endAt, :prevStepId, :nextStepId,
-           :stepOrder, :attributesJson, :failureMessage)
+           :stepOrder, :stage, :attributesJson, :failureMessage)
         """);
-    workflow.workflowSteps().forEach(
-        step -> {
-          if (!workflow.id().equals(step.workflowId())) {
-            throw new IllegalArgumentException(
-                "Workflow step " + step.id() + " belongs to a different workflow");
-          }
-          batch.bind("id", step.id())
-              .bind("workflowId", workflow.id())
-              .bind("createdAt", step.createdAt())
-              .bind("updatedAt", step.updatedAt())
-              .bind("jobId", step.jobRecordId())
-              .bind("status", step.status().name())
-              .bind("startAt", step.processStartAt())
-              .bind("endAt", step.processEndAt())
-              .bind("prevStepId", step.prevStepId())
-              .bind("nextStepId", step.nextStepId())
-              .bind("stepOrder", step.sequence())
-              .bind("attributesJson", serializeValue(step.attributes(), "Workflow step attributes"))
-              .bind("failureMessage", step.failureMessage())
-              .add();
-        });
+    steps.forEach(step -> bindStep(batch, workflowId, step).add());
     batch.execute();
+  }
+
+  private org.jdbi.v3.core.statement.PreparedBatch bindStep(
+      org.jdbi.v3.core.statement.PreparedBatch batch, String workflowId, WorkflowStep step) {
+    if (!workflowId.equals(step.workflowId())) {
+      throw new IllegalArgumentException(
+          "Workflow step " + step.id() + " belongs to a different workflow");
+    }
+    return batch.bind("id", step.id())
+        .bind("workflowId", workflowId)
+        .bind("createdAt", step.createdAt())
+        .bind("updatedAt", step.updatedAt())
+        .bind("jobId", step.jobRecordId())
+        .bind("status", step.status().name())
+        .bind("startAt", step.processStartAt())
+        .bind("endAt", step.processEndAt())
+        .bind("prevStepId", step.prevStepId())
+        .bind("nextStepId", step.nextStepId())
+        .bind("stepOrder", step.sequence())
+        .bind("stage", step.stage())
+        .bind("attributesJson", serializeValue(step.attributes(), "Workflow step attributes"))
+        .bind("failureMessage", step.failureMessage());
   }
 
   private String serializeValue(Object value, String description) {

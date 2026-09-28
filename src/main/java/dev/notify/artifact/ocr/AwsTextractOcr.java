@@ -1,4 +1,4 @@
-package dev.notify.artifact.extract;
+package dev.notify.artifact.ocr;
 
 import java.io.IOException;
 import java.io.InputStream;

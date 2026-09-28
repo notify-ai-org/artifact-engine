@@ -10,11 +10,36 @@ import java.util.Map;
 import java.util.Objects;
 import org.jdbi.v3.core.Jdbi;
 import org.jdbi.v3.core.result.ResultBearing;
+import org.jdbi.v3.core.statement.PreparedBatch;
 import org.jdbi.v3.core.statement.Query;
 
 /** PostgreSQL/pgvector adapter using Jdbi and tenant-first SQL. */
 public final class JdbiVectorStore implements VectorStore {
   private static final int MAX_LIMIT = 1_000;
+  private static final String UPSERT_SQL =
+      """
+      INSERT INTO artifact_chunk (
+          id, artifact_id, tenant_id, chunk_index, text, token_count, page_number,
+          section, coordinates_json, content_sha256, embedding_model,
+          embedding_version, embedding
+      ) VALUES (
+          :id, :artifactId, :tenantId, :chunkIndex, :text, :tokenCount, :pageNumber,
+          :section, CAST(:coordinates AS jsonb), :contentSha256, :embeddingModel,
+          :embeddingVersion, CAST(:embedding AS vector)
+      )
+      ON CONFLICT (
+          tenant_id, artifact_id, chunk_index, embedding_model, embedding_version
+      ) DO UPDATE SET
+          id = EXCLUDED.id,
+          text = EXCLUDED.text,
+          token_count = EXCLUDED.token_count,
+          page_number = EXCLUDED.page_number,
+          section = EXCLUDED.section,
+          coordinates_json = EXCLUDED.coordinates_json,
+          content_sha256 = EXCLUDED.content_sha256,
+          embedding = EXCLUDED.embedding
+      """;
+
 
   private final Jdbi jdbi;
   private final ObjectMapper json;
@@ -31,33 +56,18 @@ public final class JdbiVectorStore implements VectorStore {
 
   @Override
   public void upsert(ArtifactChunk chunk) {
-    validateChunk(chunk);
-    jdbi.useHandle(
-        handle ->
-            handle
-                .createUpdate(
-                    """
-                    INSERT INTO artifact_chunk (
-                        id, artifact_id, tenant_id, chunk_index, text, token_count, page_number,
-                        section, coordinates_json, content_sha256, embedding_model,
-                        embedding_version, embedding
-                    ) VALUES (
-                        :id, :artifactId, :tenantId, :chunkIndex, :text, :tokenCount, :pageNumber,
-                        :section, CAST(:coordinates AS jsonb), :contentSha256, :embeddingModel,
-                        :embeddingVersion, CAST(:embedding AS vector)
-                    )
-                    ON CONFLICT (
-                        tenant_id, artifact_id, chunk_index, embedding_model, embedding_version
-                    ) DO UPDATE SET
-                        id = EXCLUDED.id,
-                        text = EXCLUDED.text,
-                        token_count = EXCLUDED.token_count,
-                        page_number = EXCLUDED.page_number,
-                        section = EXCLUDED.section,
-                        coordinates_json = EXCLUDED.coordinates_json,
-                        content_sha256 = EXCLUDED.content_sha256,
-                        embedding = EXCLUDED.embedding
-                    """)
+    upsertAll(List.of(chunk));
+  }
+
+  @Override
+  public void upsertAll(List<ArtifactChunk> chunks) {
+    if (chunks.isEmpty()) return;
+    chunks.forEach(this::validateChunk);
+    jdbi.useTransaction(
+        handle -> {
+          PreparedBatch batch = handle.prepareBatch(UPSERT_SQL);
+          for (ArtifactChunk chunk : chunks) {
+            batch
                 .bind("id", chunk.id())
                 .bind("artifactId", chunk.artifactId())
                 .bind("tenantId", chunk.tenantId())
@@ -71,6 +81,67 @@ public final class JdbiVectorStore implements VectorStore {
                 .bind("embeddingModel", chunk.embeddingModel())
                 .bind("embeddingVersion", chunk.embeddingVersion())
                 .bind("embedding", vectorLiteral(chunk.embedding()))
+                .add();
+          }
+          batch.execute();
+        });
+  }
+
+  @Override
+  public Map<Integer, String> chunkIds(
+      String tenantId,
+      String artifactId,
+      String embeddingModel,
+      String embeddingVersion,
+      int fromIndex,
+      int toIndex) {
+    requireIdentity(tenantId, artifactId);
+    Map<Integer, String> ids = new java.util.HashMap<>();
+    jdbi.useHandle(
+        handle ->
+            handle
+                .createQuery(
+                    """
+                    SELECT chunk_index, id
+                    FROM artifact_chunk
+                    WHERE tenant_id = :tenantId AND artifact_id = :artifactId
+                      AND embedding_model = :model AND embedding_version = :version
+                      AND chunk_index >= :fromIndex AND chunk_index < :toIndex
+                    """)
+                .bind("tenantId", tenantId)
+                .bind("artifactId", artifactId)
+                .bind("model", embeddingModel)
+                .bind("version", embeddingVersion)
+                .bind("fromIndex", fromIndex)
+                .bind("toIndex", toIndex)
+                .map((row, context) -> Map.entry(row.getInt("chunk_index"), row.getString("id")))
+                .forEach(entry -> ids.put(entry.getKey(), entry.getValue())));
+    return ids;
+  }
+
+  @Override
+  public void deleteChunksFrom(
+      String tenantId,
+      String artifactId,
+      String embeddingModel,
+      String embeddingVersion,
+      int fromIndex) {
+    requireIdentity(tenantId, artifactId);
+    jdbi.useHandle(
+        handle ->
+            handle
+                .createUpdate(
+                    """
+                    DELETE FROM artifact_chunk
+                    WHERE tenant_id = :tenantId AND artifact_id = :artifactId
+                      AND embedding_model = :model AND embedding_version = :version
+                      AND chunk_index >= :fromIndex
+                    """)
+                .bind("tenantId", tenantId)
+                .bind("artifactId", artifactId)
+                .bind("model", embeddingModel)
+                .bind("version", embeddingVersion)
+                .bind("fromIndex", fromIndex)
                 .execute());
   }
 
