@@ -15,10 +15,15 @@ import dev.notify.artifact.spool.DurableSpool;
 import dev.notify.artifact.store.MetadataStore;
 import dev.notify.artifact.store.ObjectStore;
 import dev.notify.artifact.store.VectorStore;
+import dev.notify.artifact.worker.Worker;
+import dev.notify.artifact.worker.WorkerManager;
 import java.io.IOException;
 import java.io.InputStream;
+import java.time.Duration;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
+import java.util.function.Consumer;
 
 /**
  * Thin public facade that converts incoming operations to typed jobs and dispatches them. Workflow
@@ -27,11 +32,21 @@ import java.util.Objects;
 public final class DefaultArtifactEngine implements ArtifactEngine {
   private final ArtifactJobFactory jobFactory;
   private final JobDispatcher dispatcher;
+  private final WorkerManager workerManager;
 
   public DefaultArtifactEngine(ArtifactJobFactory jobFactory, JobDispatcher dispatcher) {
+    this(jobFactory, dispatcher, null);
+  }
+
+  /**
+   * @param workerManager optional; backs the worker administration methods. The engine does not
+   *     own it and never closes it.
+   */
+  public DefaultArtifactEngine(
+      ArtifactJobFactory jobFactory, JobDispatcher dispatcher, WorkerManager workerManager) {
     this.jobFactory = Objects.requireNonNull(jobFactory, "jobFactory");
     this.dispatcher = Objects.requireNonNull(dispatcher, "dispatcher");
-    
+    this.workerManager = workerManager;
   }
 
   public DefaultArtifactEngine(
@@ -115,6 +130,73 @@ public final class DefaultArtifactEngine implements ArtifactEngine {
   @Override
   public void delete(String principalId, String tenantId, String artifactId) throws IOException {
     dispatchIo(jobFactory.createDelete(principalId, tenantId, artifactId), "delete");
+  }
+
+  @Override
+  public WorkerManager.WorkerSnapshot addWorker(WorkerManager.WorkerConfiguration configuration) {
+    Objects.requireNonNull(configuration, "configuration");
+    WorkerManager manager = workers("add a worker");
+    manager.add(
+        configuration.id(),
+        configuration.queueCapacity(),
+        configuration.batchSize(),
+        configuration.batchBytes(),
+        configuration.flushInterval(),
+        configuration.type());
+    return manager.snapshots().get(configuration.id());
+  }
+
+  @Override
+  public void removeWorker(String workerId) {
+    workers("remove a worker").remove(Objects.requireNonNull(workerId, "workerId"));
+  }
+
+  @Override
+  public int removeIdleWorkers(Duration idle) {
+    return workers("remove idle workers").removeIdle(Objects.requireNonNull(idle, "idle"));
+  }
+
+  @Override
+  public Map<String, WorkerManager.WorkerSnapshot> workers() {
+    return workers("list workers").snapshots();
+  }
+
+  @Override
+  public int maxWorkers() {
+    return workers("read the worker limit").maxWorkers();
+  }
+
+  @Override
+  public int restoreWorkers() throws IOException {
+    return workers("restore workers").restore();
+  }
+
+  @Override
+  public void saveWorkerSnapshots() throws IOException {
+    workers("save worker snapshots").flushSnapshots();
+  }
+
+  @Override
+  public Map<String, Worker.StateChange> jobStates() {
+    return workers("read job states").stateChanges();
+  }
+
+  @Override
+  public void addJobStateListener(Consumer<Worker.StateChange> listener) {
+    workers("add a job state listener").addStateChangeListener(listener);
+  }
+
+  @Override
+  public void removeJobStateListener(Consumer<Worker.StateChange> listener) {
+    workers("remove a job state listener").removeStateChangeListener(listener);
+  }
+
+  private WorkerManager workers(String operation) {
+    if (workerManager == null) {
+      throw new UnsupportedOperationException(
+          "Cannot " + operation + ": this engine has no worker manager");
+    }
+    return workerManager;
   }
 
   private <R> R dispatch(Job<R> job, String operation) {
