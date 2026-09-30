@@ -22,6 +22,15 @@ import java.util.function.Consumer;
 public interface ArtifactEngine {
   Artifact ingest(Requests.Ingest request) throws IOException;
 
+  /**
+   * Ingests content the engine reads itself from a URL or allowed file, chunk by chunk through a
+   * bounded buffer pool. Returns once the artifact is registered and its workflow planned; the
+   * content is read, spooled, stored, and indexed asynchronously.
+   */
+  default Artifact ingestFromSource(Requests.IngestSource request) throws IOException {
+    throw new UnsupportedOperationException("Source ingest is not supported");
+  }
+
   Artifact metadata(String principalId, String tenantId, String artifactId);
 
   default List<Artifact> listMetadata(String principalId, String tenantId, int limit) {

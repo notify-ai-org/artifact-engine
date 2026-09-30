@@ -49,7 +49,8 @@ public final class StoreInitJob extends AbstractJob<Artifact> {
           "upload", upload.uploadId(), "parts", upload.partCount());
     } else {
       String key = keyFactory.key(artifact);
-      String uploadId = objectStore.createMultipartUpload(record.tenantId(), key, artifact.sha256());
+      String uploadId =
+          objectStore.createMultipartUpload(record.tenantId(), key, contentDigest(record, artifact));
       upload =
           uploads.putIfAbsent(
               new MultipartUpload(

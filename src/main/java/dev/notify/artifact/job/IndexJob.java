@@ -1,5 +1,7 @@
 package dev.notify.artifact.job;
 
+import dev.notify.artifact.chunk.ChunkEmbeddingWriter;
+import dev.notify.artifact.chunk.ChunkLimitReached;
 import dev.notify.artifact.embed.EmbeddingService;
 import dev.notify.artifact.extract.TextExtractor;
 import dev.notify.artifact.extract.TextExtractorFactory;
@@ -154,7 +156,9 @@ public final class IndexJob extends AbstractJob<Integer> implements QueueableJob
         "type", artifact.mediaType(), "bytes", artifact.sizeBytes(),
         "model", embeddingService.model(), "maxChunks", options.maxChunks(),
         "policy", options.chunkLimitPolicy());
-    ChunkWriter writer = new ChunkWriter(artifact);
+    ChunkEmbeddingWriter writer = new ChunkEmbeddingWriter(
+        artifact, embeddingService, vectorStore, options.commitBatchSize(), options.maxChunks(),
+        () -> updateIndex(ArtifactStatus.Index.EMBEDDING));
     try {
       updateIndex(ArtifactStatus.Index.EXTRACTING);
 
@@ -178,7 +182,7 @@ public final class IndexJob extends AbstractJob<Integer> implements QueueableJob
       vectorStore.deleteChunksFrom(
           tenantId, artifactId, embeddingService.model(), embeddingService.version(), chunkCount);
       LOG.info("index_completed", "artifact", artifactId, "chunks", chunkCount,
-          "embedded", writer.embedded, "reused", writer.reused, "batches", writer.batches,
+          "embedded", writer.embedded(), "reused", writer.reused(), "batches", writer.batches(),
           "truncated", truncated, "duration", Duration.between(started, Instant.now()));
 
       // Clearing the failure fields also drops a stale truncation flag from an earlier version.
@@ -196,7 +200,7 @@ public final class IndexJob extends AbstractJob<Integer> implements QueueableJob
           ? "INDEX_CHUNK_LIMIT_EXCEEDED"
           : "INDEXING_FAILED";
       LOG.warn("index_failed", "artifact", artifactId, "code", code,
-          "embedded", writer.embedded, "reused", writer.reused,
+          "embedded", writer.embedded(), "reused", writer.reused(),
           "duration", Duration.between(started, Instant.now()),
           "error", failure.getClass().getSimpleName(), "reason", safeMessage(failure));
       metadataStore.update(
@@ -226,7 +230,7 @@ public final class IndexJob extends AbstractJob<Integer> implements QueueableJob
     return 0;
   }
 
-  private int extractInto(Artifact artifact, Path file, ChunkWriter writer) throws IOException {
+  private int extractInto(Artifact artifact, Path file, ChunkEmbeddingWriter writer) throws IOException {
     var nativeExtractor = extractorFactory.find(artifact.mediaType());
     if (nativeExtractor.isPresent()) {
       LOG.debug("index_extracting", "artifact", artifactId,
@@ -293,107 +297,8 @@ public final class IndexJob extends AbstractJob<Integer> implements QueueableJob
     }
   }
 
-  /** Buffers chunks, skips ones an earlier attempt already committed, and embeds the rest. */
-  private final class ChunkWriter implements Chunker.ChunkConsumer {
-    private final Artifact artifact;
-    private final List<String> texts = new ArrayList<>(options.commitBatchSize());
-    private int firstIndex;
-    private boolean embeddingStarted;
-    // Totals for the job summary; the writer runs on a single thread.
-    private int embedded;
-    private int reused;
-    private int batches;
-
-    private ChunkWriter(Artifact artifact) {
-      this.artifact = artifact;
-    }
-
-    @Override
-    public void accept(int index, String text) throws ChunkLimitReached {
-      // Thrown from inside the extractor callback, so reading stops at the budget.
-      if (index >= options.maxChunks()) throw new ChunkLimitReached();
-      if (texts.isEmpty()) firstIndex = index;
-      texts.add(text);
-      if (texts.size() >= options.commitBatchSize()) flush();
-    }
-
-    void flush() {
-      if (texts.isEmpty()) return;
-      if (!embeddingStarted) {
-        updateIndex(ArtifactStatus.Index.EMBEDDING);
-        embeddingStarted = true;
-      }
-      String model = embeddingService.model();
-      String version = embeddingService.version();
-      Map<Integer, String> committed =
-          vectorStore.chunkIds(
-              tenantId, artifactId, model, version, firstIndex, firstIndex + texts.size());
-
-      List<Integer> pendingIndexes = new ArrayList<>();
-      List<String> pendingTexts = new ArrayList<>();
-      List<String> pendingHashes = new ArrayList<>();
-      for (int offset = 0; offset < texts.size(); offset++) {
-        int index = firstIndex + offset;
-        String text = texts.get(offset);
-        String contentHash = Checksum.sha256(text);
-        // The id covers artifact version, index, and content, so a match means nothing changed.
-        if (!chunkId(index, contentHash).equals(committed.get(index))) {
-          pendingIndexes.add(index);
-          pendingTexts.add(text);
-          pendingHashes.add(contentHash);
-        }
-      }
-
-      if (!pendingTexts.isEmpty()) {
-        List<float[]> embeddings = embeddingService.embed(pendingTexts);
-        List<ArtifactChunk> chunks = new ArrayList<>(pendingTexts.size());
-        for (int i = 0; i < pendingTexts.size(); i++) {
-          String text = pendingTexts.get(i);
-          chunks.add(
-              new ArtifactChunk(
-                  chunkId(pendingIndexes.get(i), pendingHashes.get(i)),
-                  artifact.id(),
-                  artifact.tenantId(),
-                  pendingIndexes.get(i),
-                  text,
-                  estimateTokens(text),
-                  null,
-                  null,
-                  Map.of(),
-                  pendingHashes.get(i),
-                  model,
-                  version,
-                  embeddings.get(i)));
-        }
-        vectorStore.upsertAll(chunks);
-      }
-      batches++;
-      embedded += pendingTexts.size();
-      reused += texts.size() - pendingTexts.size();
-      LOG.debug("index_batch_committed", "artifact", artifactId, "batch", batches,
-          "firstChunk", firstIndex, "chunks", texts.size(), "embedded", pendingTexts.size(),
-          "reused", texts.size() - pendingTexts.size());
-      texts.clear();
-    }
-
-    private String chunkId(int index, String contentHash) {
-      return Checksum.sha256(
-          artifact.id() + ":" + artifact.version() + ":" + index + ":" + contentHash);
-    }
-  }
-
   private String limitMessage() {
     return "Document exceeds the per-artifact budget of " + options.maxChunks() + " chunks";
-  }
-
-  /**
-   * Internal stop signal. An IOException so it passes unchanged through extractors, including
-   * SAX-based ones that only tunnel checked sink failures.
-   */
-  private static final class ChunkLimitReached extends IOException {
-    private ChunkLimitReached() {
-      super("chunk budget reached");
-    }
   }
 
   /** The document produced more chunks than allowed under {@link ChunkLimitPolicy#FAIL}. */
@@ -411,10 +316,6 @@ public final class IndexJob extends AbstractJob<Integer> implements QueueableJob
 
   private void updateIndex(ArtifactStatus.Index status) {
     metadataStore.update(tenantId, artifactId, current -> current.withIndex(status));
-  }
-
-  private static int estimateTokens(String text) {
-    return Math.max(1, (int) Math.ceil(text.length() / 4.0));
   }
 
   private static String safeMessage(Exception failure) {

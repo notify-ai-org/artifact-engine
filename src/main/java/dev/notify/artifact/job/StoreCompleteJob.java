@@ -76,7 +76,8 @@ public final class StoreCompleteJob extends AbstractJob<Artifact> {
         LOG.debug("multipart_assembled", "artifact", record.artifactId(),
             "composite", composite, "duration", Duration.between(started, Instant.now()));
         if (!objectStore.verifiedMultipart(
-            record.tenantId(), key, artifact.sizeBytes(), artifact.sha256(), composite)) {
+            record.tenantId(), key, artifact.sizeBytes(), contentDigest(record, artifact),
+            composite)) {
           throw new IOException("Object store did not verify the assembled artifact");
         }
       }
@@ -112,8 +113,8 @@ public final class StoreCompleteJob extends AbstractJob<Artifact> {
 
   private boolean alreadyCompleted(Artifact artifact, MultipartUpload upload) throws IOException {
     return objectStore.verifiedMultipart(
-        record.tenantId(), upload.storageKey(), artifact.sizeBytes(), artifact.sha256(),
-        upload.compositeSha256());
+        record.tenantId(), upload.storageKey(), artifact.sizeBytes(),
+        contentDigest(record, artifact), upload.compositeSha256());
   }
 
   private static void requireAllParts(

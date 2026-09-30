@@ -1,5 +1,6 @@
 package dev.notify.artifact;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -81,6 +82,52 @@ class DurableSpoolTest {
 
     assertEquals(0, spool.usage().bytes());
     assertEquals(0, spool.usage().files());
+  }
+
+  @Test
+  void chunkedEntriesReserveQuotaWriteOutOfOrderAndCommitOnce() throws Exception {
+    byte[] content = "0123456789abcdefghij".getBytes();
+    var spool = new DurableSpool(root, 100, new ObjectMapper());
+
+    Path target = spool.reserve("t", "chunked", content.length, Map.of());
+    assertEquals(content.length, spool.usage().bytes());
+    assertFalse(Files.exists(target), "readers never see an uncommitted entry");
+
+    spool.writeChunk(target, 10, java.nio.ByteBuffer.wrap(content, 10, 10));
+    spool.writeChunk(target, 0, java.nio.ByteBuffer.wrap(content, 0, 10));
+    var committed = spool.commit(target, content.length);
+    var again = spool.commit(target, content.length);
+    spool.writeChunk(target, 0, java.nio.ByteBuffer.wrap(new byte[10]));
+
+    assertEquals(Checksum.sha256(new ByteArrayInputStream(content)), committed.sha256());
+    assertEquals(committed, again);
+    assertArrayEquals(content, Files.readAllBytes(target), "writes after commit are ignored");
+    assertEquals(content.length, spool.usage().bytes());
+  }
+
+  @Test
+  void reservedQuotaSurvivesARestartAndIsReleasedOnDiscard() throws Exception {
+    var spool = new DurableSpool(root, 100, new ObjectMapper());
+    Path target = spool.reserve("t", "chunked", 40, Map.of());
+
+    var restarted = new DurableSpool(root, 100, new ObjectMapper());
+    assertEquals(40, restarted.usage().bytes());
+
+    restarted.discardReserved(target);
+    assertEquals(0, restarted.usage().bytes());
+    assertEquals(0, restarted.usage().files());
+  }
+
+  @Test
+  void refusesToReserveMoreThanTheArtifactLimitOrWriteOutsideTheReservation() throws Exception {
+    var spool = new DurableSpool(root, 10, new ObjectMapper());
+    assertThrows(DurableSpool.SpoolQuotaExceededException.class,
+        () -> spool.reserve("t", "big", 11, Map.of()));
+
+    Path target = spool.reserve("t", "small", 10, Map.of());
+    assertThrows(IOException.class,
+        () -> spool.writeChunk(target, 8, java.nio.ByteBuffer.wrap(new byte[4])));
+    assertThrows(IOException.class, () -> spool.commit(target, 9));
   }
 
   /** Delivers content in small reads, optionally failing once it is exhausted. */

@@ -54,6 +54,21 @@ public final class ArtifactAccessVerifier {
     return Jsoup.parse(content).text();
   }
 
+  /** The display name that intake stores for a caller-supplied file name. */
+  public String sanitizedFilename(String originalName) {
+    return sanitizeFilename(originalName);
+  }
+
+  /** Detects the media type from the first bytes of content that is not yet in a file. */
+  public String verifyPrefix(byte[] prefix, String declaredMediaType) throws IOException {
+    return dataVerifier.verifyPrefix(prefix, declaredMediaType);
+  }
+
+  /** Re-verifies complete content against the type detected when it was planned. */
+  public String verifyContent(Path contentPath, String expectedMediaType) throws IOException {
+    return dataVerifier.verify(contentPath, expectedMediaType);
+  }
+
   private static String sanitizeFilename(String originalName) {
     if (originalName == null || originalName.isBlank()) {
       return "artifact";

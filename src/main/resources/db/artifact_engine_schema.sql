@@ -125,6 +125,7 @@ CREATE TABLE artifact_workflow_step (
     job_record_id VARCHAR(64) NOT NULL UNIQUE,
     step_order INTEGER NOT NULL,
     stage INTEGER NOT NULL,
+    depends_on_json TEXT NOT NULL DEFAULT '[]',
     created_at TIMESTAMPTZ NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL,
     status VARCHAR(32) NOT NULL,
@@ -156,5 +157,15 @@ CREATE TABLE artifact_multipart_upload (
     part_count INTEGER NOT NULL,
     created_at TIMESTAMPTZ NOT NULL,
     composite_sha256 VARCHAR(64),
+    PRIMARY KEY (tenant_id, artifact_id, version)
+);
+
+CREATE TABLE artifact_index_progress (
+    tenant_id VARCHAR(128) NOT NULL,
+    artifact_id VARCHAR(64) NOT NULL,
+    version BIGINT NOT NULL,
+    last_chunk INTEGER NOT NULL,
+    state_json TEXT NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL,
     PRIMARY KEY (tenant_id, artifact_id, version)
 );

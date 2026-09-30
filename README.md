@@ -80,6 +80,8 @@ src/main/resources/db/migration/V3__artifact_workflow_step_details.sql
 src/main/resources/db/migration/V4__normalize_workflow_records.sql
 src/main/resources/db/migration/V5__staged_workflows_and_multipart_uploads.sql
 src/main/resources/db/migration/V6__workflow_retries_and_job_priority.sql
+src/main/resources/db/migration/V7__step_dependencies.sql
+src/main/resources/db/migration/V8__index_progress.sql
 ```
 
 `V1` installs the `vector` extension and declares `vector(1536)`. If a different embedding size is

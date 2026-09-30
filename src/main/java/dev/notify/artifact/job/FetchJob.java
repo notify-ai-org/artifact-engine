@@ -45,9 +45,14 @@ public final class FetchJob extends AbstractJob<InputStream> implements DirectJo
         AuthorizationService.Permission.DOWNLOAD,
         artifact,
         null);
-    return artifact.storageKey() != null
-            && artifact.storageStatus() == ArtifactStatus.Storage.STORED
-        ? objectStore.get(tenantId, artifact.storageKey())
-        : durableSpool.open(artifact.spoolPath());
+    if (artifact.storageKey() != null
+        && artifact.storageStatus() == ArtifactStatus.Storage.STORED) {
+      return objectStore.get(tenantId, artifact.storageKey());
+    }
+    if (artifact.spoolPath() == null) {
+      // A spool-free source ingest has no local copy; its content is readable once stored.
+      throw new java.util.NoSuchElementException("Artifact content is not available yet");
+    }
+    return durableSpool.open(artifact.spoolPath());
   }
 }

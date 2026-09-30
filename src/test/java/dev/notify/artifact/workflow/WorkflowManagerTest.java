@@ -227,6 +227,72 @@ class WorkflowManagerTest {
   }
 
   @Test
+  void runsDependentStepsOfAStageInDependencyOrderAndIndependentOnesInParallel() {
+    InMemoryWorkflowStore store = new InMemoryWorkflowStore();
+    try (QueueManager queues = new QueueManager();
+        WorkflowManager manager =
+            new WorkflowManager(store, queues, Duration.ofSeconds(1), failure -> {})) {
+      JobRecord buffer = job("buffer-1", JobRecord.JobType.STORE);
+      JobRecord spool = job("spool-1", JobRecord.JobType.STORE_INIT);
+      JobRecord store1 = job("store-1", JobRecord.JobType.STORE_PART);
+      JobRecord index1 = job("index-1", JobRecord.JobType.INDEX);
+      JobRecord release = job("release-1", JobRecord.JobType.RELEASE_SPOOL);
+      Workflow workflow = manager.createPlan("chunked", List.of(
+          List.of(
+              WorkflowManager.PlannedStep.independent(buffer),
+              WorkflowManager.PlannedStep.after(spool, buffer),
+              WorkflowManager.PlannedStep.after(store1, spool),
+              WorkflowManager.PlannedStep.after(index1, spool),
+              WorkflowManager.PlannedStep.after(release, store1, index1)),
+          List.of(WorkflowManager.PlannedStep.independent(
+              job("next-stage", JobRecord.JobType.STORE_COMPLETE)))), Map.of());
+
+      manager.runOnce();
+      assertEquals(List.of("buffer-1"), drain(queues, JobRecord.JobType.STORE));
+      assertEquals(List.of(), drain(queues, JobRecord.JobType.STORE_INIT));
+
+      complete(manager, "buffer-1", JobRecord.JobType.STORE);
+      manager.runOnce();
+      assertEquals(List.of("spool-1"), drain(queues, JobRecord.JobType.STORE_INIT));
+
+      complete(manager, "spool-1", JobRecord.JobType.STORE_INIT);
+      manager.runOnce();
+      assertEquals(List.of("store-1"), drain(queues, JobRecord.JobType.STORE_PART));
+      assertEquals(List.of("index-1"), drain(queues, JobRecord.JobType.INDEX));
+
+      complete(manager, "store-1", JobRecord.JobType.STORE_PART);
+      manager.runOnce();
+      assertEquals(List.of(), drain(queues, JobRecord.JobType.RELEASE_SPOOL));
+
+      complete(manager, "index-1", JobRecord.JobType.INDEX);
+      manager.runOnce();
+      assertEquals(List.of("release-1"), drain(queues, JobRecord.JobType.RELEASE_SPOOL));
+      assertEquals(List.of(), drain(queues, JobRecord.JobType.STORE_COMPLETE));
+
+      complete(manager, "release-1", JobRecord.JobType.RELEASE_SPOOL);
+      manager.runOnce();
+      assertEquals(List.of("next-stage"), drain(queues, JobRecord.JobType.STORE_COMPLETE));
+      assertEquals(2, store.find(workflow.id()).orElseThrow().workflowSteps().get(4)
+          .dependsOn().size(), "release waits for both store and index");
+    }
+  }
+
+  @Test
+  void rejectsADependencyThatIsNotEarlierInTheSameStage() {
+    try (QueueManager queues = new QueueManager();
+        WorkflowManager manager = new WorkflowManager(
+            new InMemoryWorkflowStore(), queues, Duration.ofSeconds(1), failure -> {})) {
+      JobRecord first = job("first", JobRecord.JobType.STORE);
+      JobRecord second = job("second", JobRecord.JobType.INDEX);
+
+      org.junit.jupiter.api.Assertions.assertThrows(IllegalArgumentException.class, () ->
+          manager.createPlan("bad", List.of(List.of(
+              WorkflowManager.PlannedStep.after(first, second),
+              WorkflowManager.PlannedStep.independent(second))), Map.of()));
+    }
+  }
+
+  @Test
   void logsTheWorkflowLifecycleAsStructuredEvents() {
     java.util.logging.Logger julLogger =
         java.util.logging.Logger.getLogger(WorkflowManager.class.getName());

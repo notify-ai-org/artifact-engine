@@ -38,12 +38,36 @@ public final class Chunker {
 
   /** Starts an incremental chunking session that emits chunks to {@code consumer} in order. */
   public Session stream(ChunkConsumer consumer) {
-    return new Session(java.util.Objects.requireNonNull(consumer, "consumer"));
+    return new Session(java.util.Objects.requireNonNull(consumer, "consumer"), State.INITIAL);
+  }
+
+  /**
+   * Continues a session from a {@link Session#snapshot()}, possibly in another job or process.
+   * Feeding text across snapshot and resume yields exactly the chunks of one uninterrupted session.
+   */
+  public Session resume(State state, ChunkConsumer consumer) {
+    return new Session(
+        java.util.Objects.requireNonNull(consumer, "consumer"),
+        java.util.Objects.requireNonNull(state, "state"));
   }
 
   @FunctionalInterface
   public interface ChunkConsumer {
     void accept(int index, String text) throws IOException;
+  }
+
+  /**
+   * Everything a session carries between {@link Session#accept} calls: the overlap window (at most
+   * one chunk of words), a word cut off at the end of the last input, and the next chunk index.
+   */
+  public record State(List<String> window, String partialWord, int nextIndex) {
+    public static final State INITIAL = new State(List.of(), "", 0);
+
+    public State {
+      window = List.copyOf(window);
+      partialWord = partialWord == null ? "" : partialWord;
+      if (nextIndex < 0) throw new IllegalArgumentException("nextIndex cannot be negative");
+    }
   }
 
   /** Single-use, single-threaded chunking session. Words may span {@link #accept} calls. */
@@ -54,8 +78,20 @@ public final class Chunker {
     private int nextIndex;
     private boolean finished;
 
-    private Session(ChunkConsumer consumer) {
+    private Session(ChunkConsumer consumer, State state) {
+      if (state.window().size() >= wordsPerChunk) {
+        throw new IllegalArgumentException("Saved window exceeds the chunk size");
+      }
       this.consumer = consumer;
+      this.window.addAll(state.window());
+      this.word.append(state.partialWord());
+      this.nextIndex = state.nextIndex();
+    }
+
+    /** The session's carried state; valid until the next {@link #accept} or {@link #finish}. */
+    public State snapshot() {
+      requireOpen();
+      return new State(List.copyOf(window), word.toString(), nextIndex);
     }
 
     public void accept(CharSequence text) throws IOException {

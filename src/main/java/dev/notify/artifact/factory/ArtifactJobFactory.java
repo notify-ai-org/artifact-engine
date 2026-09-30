@@ -10,6 +10,11 @@ import java.util.List;
 public interface ArtifactJobFactory {
   Job<Artifact> createIngest(Requests.Ingest request);
 
+  /** A chunked ingest from a source location; unsupported unless chunked ingest is configured. */
+  default Job<Artifact> createSourceIngest(Requests.IngestSource request) {
+    throw new UnsupportedOperationException("Source ingest is not configured");
+  }
+
   Job<Artifact> createMetadata(String principalId, String tenantId, String artifactId);
 
   Job<List<Artifact>> createListMetadata(String principalId, String tenantId, int limit);

@@ -29,7 +29,9 @@ public interface ObjectStore extends Store<InputStream> {
    * Starts a multipart upload with the same encryption and tenant/checksum metadata as {@link
    * #put}. Each part is later verified by the store against its own SHA-256.
    *
-   * @param sha256 lowercase hex SHA-256 of the whole object, recorded as object metadata
+   * @param sha256 lowercase hex SHA-256 of the whole object, recorded as object metadata; null
+   *     when the content is still arriving (chunked ingest), in which case the per-part checksums
+   *     and the composite checksum are the object's integrity proof
    * @return the store's upload id
    */
   default String createMultipartUpload(String tenantId, String key, String sha256)
@@ -75,6 +77,7 @@ public interface ObjectStore extends Store<InputStream> {
   /**
    * Verifies an object assembled from parts: same checks as {@link #verified}, except that the
    * stored checksum is the composite form {@link #compositeSha256} rather than a whole-object hash.
+   * A null {@code sha256} skips the whole-object metadata check, for uploads created without one.
    */
   default boolean verifiedMultipart(
       String tenantId, String key, long length, String sha256, String compositeSha256)

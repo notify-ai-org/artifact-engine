@@ -2,6 +2,7 @@ package dev.notify.artifact.embed;
 
 import dev.notify.artifact.retry.RetryExecutor;
 import dev.notify.artifact.retry.RetryPolicy;
+import dev.notify.artifact.cache.QueryEmbeddingCache;
 import dev.notify.artifact.util.Checksum;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -25,6 +26,7 @@ public final class EmbeddingService implements AutoCloseable {
   private final EmbeddingCache cache;
   private final Duration cacheTtl;
   private final ScheduledExecutorService executor;
+  private final QueryEmbeddingCache queryCache;
 
   public EmbeddingService(EmbeddingProvider provider, EmbeddingCache cache, int maxBatchSize) {
     this(
@@ -43,6 +45,21 @@ public final class EmbeddingService implements AutoCloseable {
       Duration maxWait,
       Duration cacheTtl,
       RetryPolicy retryPolicy) {
+    this(providers, cache, maxBatchSize, maxWait, cacheTtl, retryPolicy, null);
+  }
+
+  /**
+   * @param queryCache backs {@link #embedQuery}; null sends queries through the general cache
+   */
+  public EmbeddingService(
+      List<EmbeddingProvider> providers,
+      EmbeddingCache cache,
+      int maxBatchSize,
+      Duration maxWait,
+      Duration cacheTtl,
+      RetryPolicy retryPolicy,
+      QueryEmbeddingCache queryCache) {
+    this.queryCache = queryCache;
     if (providers == null || providers.isEmpty()) {
       throw new IllegalArgumentException("at least one embedding model is required");
     }
@@ -84,6 +101,33 @@ public final class EmbeddingService implements AutoCloseable {
   }
 
   public List<float[]> embed(String model, List<String> texts) {
+    return embed(model, texts, true);
+  }
+
+  /**
+   * Embeds a search query with the default model. With a {@link QueryEmbeddingCache}, repeated
+   * (normalized) queries skip the provider and concurrent identical queries share one call.
+   */
+  public float[] embedQuery(String query) {
+    if (queryCache == null) return embed(List.of(query)).get(0);
+    ModelBatcher batcher = batchers.get(defaultModel);
+    return queryCache.get(batcher.provider.model(), batcher.provider.version(), query,
+        normalized -> embed(defaultModel, List.of(normalized), false).get(0));
+  }
+
+  /**
+   * Embeds document chunks without touching any cache: their vectors are persisted in the vector
+   * store, and caching them would only evict query vectors.
+   */
+  public List<float[]> embedDocuments(List<String> texts) {
+    return embed(defaultModel, texts, false);
+  }
+
+  public QueryEmbeddingCache queryCache() {
+    return queryCache;
+  }
+
+  private List<float[]> embed(String model, List<String> texts, boolean useCache) {
     ModelBatcher batcher = batchers.get(model);
     if (batcher == null) throw new IllegalArgumentException("Unknown embedding model: " + model);
     Objects.requireNonNull(texts, "texts");
@@ -92,9 +136,11 @@ public final class EmbeddingService implements AutoCloseable {
     for (int index = 0; index < texts.size(); index++) {
       String text = Objects.requireNonNull(texts.get(index), "embedding text");
       String hash = Checksum.sha256(text);
-      var hit = cache.get(batcher.provider.model(), batcher.provider.version(), hash);
+      var hit = useCache
+          ? cache.get(batcher.provider.model(), batcher.provider.version(), hash)
+          : java.util.Optional.<float[]>empty();
       if (hit.isPresent()) output.set(index, hit.get());
-      else misses.add(new Pending(index, text, hash, new CompletableFuture<>()));
+      else misses.add(new Pending(index, text, hash, useCache, new CompletableFuture<>()));
     }
     batcher.submit(misses);
     for (Pending pending : misses) {
@@ -181,7 +227,9 @@ public final class EmbeddingService implements AutoCloseable {
         for (int index = 0; index < batch.size(); index++) {
           Pending item = batch.get(index);
           float[] vector = Objects.requireNonNull(vectors.get(index), "embedding vector");
-          cache.put(provider.model(), provider.version(), item.hash, vector, cacheTtl);
+          if (item.cacheable) {
+            cache.put(provider.model(), provider.version(), item.hash, vector, cacheTtl);
+          }
           item.result.complete(vector.clone());
         }
       } catch (Throwable failure) {
@@ -191,5 +239,5 @@ public final class EmbeddingService implements AutoCloseable {
   }
 
   private record Pending(
-      int index, String text, String hash, CompletableFuture<float[]> result) {}
+      int index, String text, String hash, boolean cacheable, CompletableFuture<float[]> result) {}
 }

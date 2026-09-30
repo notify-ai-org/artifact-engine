@@ -33,6 +33,31 @@ public final class DataVerifier {
     return detectedMediaType;
   }
 
+  /**
+   * Detects the media type from the first bytes of content that is not yet available as a file
+   * (a chunked source at ingest). A zip prefix is accepted as DOCX only when DOCX was declared,
+   * because the zip directory is at the end; callers re-verify the complete file with {@link
+   * #verify} once it is spooled.
+   */
+  public String verifyPrefix(byte[] prefix, String declaredMediaType) throws IOException {
+    String normalizedDeclaration = normalize(declaredMediaType);
+    byte[] sniffed = prefix.length > SNIFF_BYTES ? java.util.Arrays.copyOf(prefix, SNIFF_BYTES) : prefix;
+    String detectedMediaType = detect(null, sniffed, normalizedDeclaration);
+    if (normalizedDeclaration != null && !compatible(normalizedDeclaration, detectedMediaType)) {
+      throw new IllegalArgumentException(
+          "Declared media type "
+              + normalizedDeclaration
+              + " does not match detected type "
+              + detectedMediaType);
+    }
+    return detectedMediaType;
+  }
+
+  /** How many leading bytes {@link #verifyPrefix} inspects. */
+  public static int sniffBytes() {
+    return SNIFF_BYTES;
+  }
+
   private static String detect(Path path, byte[] prefix, String declaredMediaType)
       throws IOException {
     if (startsWith(prefix, 0, 0x89, 'P', 'N', 'G')) {
@@ -47,7 +72,8 @@ public final class DataVerifier {
     if (startsWith(prefix, 0, '%', 'P', 'D', 'F')) {
       return "application/pdf";
     }
-    if (startsWith(prefix, 0, 'P', 'K', 0x03, 0x04) && isDocx(path)) {
+    if (startsWith(prefix, 0, 'P', 'K', 0x03, 0x04)
+        && (path == null ? DOCX.equals(declaredMediaType) : isDocx(path))) {
       return DOCX;
     }
     if (isUtf8Text(prefix)) {

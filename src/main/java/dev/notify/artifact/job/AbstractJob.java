@@ -53,11 +53,23 @@ public abstract class AbstractJob<R> implements Job<R> {
         return verifier.verifyExtractedContent(artifact, extractedContent);
     }
 
-     static long version(JobRecord record) {
+     public static long version(JobRecord record) {
     return longAttribute(record, "version");
   }
 
-  static long longAttribute(JobRecord record, String name) {
+  /** Attribute marking store jobs whose whole-file digest is not known when the upload starts. */
+  static final String CONTENT_DIGEST = "contentDigest";
+  static final String DEFERRED = "deferred";
+
+  /**
+   * The whole-file SHA-256 to record with the stored object, or null when the plan deferred it:
+   * a chunked ingest starts uploading before the content has been read in full.
+   */
+  static String contentDigest(JobRecord record, Artifact artifact) {
+    return DEFERRED.equals(record.attributes().get(CONTENT_DIGEST)) ? null : artifact.sha256();
+  }
+
+  public static long longAttribute(JobRecord record, String name) {
     String value = record.attributes().get(name);
     if (value == null) {
       throw new IllegalArgumentException("Job " + record.id() + " is missing attribute " + name);

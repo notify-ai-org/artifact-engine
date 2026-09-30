@@ -94,11 +94,48 @@ public final class WorkflowManager implements AutoCloseable, Consumer<Worker.Sta
    */
   public Workflow createStaged(
       String name, List<List<JobRecord>> stages, Map<String, String> attributes) {
+    return createPlan(
+        name,
+        List.copyOf(stages).stream()
+            .map(stage -> stage.stream().map(PlannedStep::independent).toList())
+            .toList(),
+        attributes);
+  }
+
+  /**
+   * A job and the jobs of the same stage it waits for.
+   *
+   * @param dependsOnJobIds ids of jobs listed earlier in the same stage
+   */
+  public record PlannedStep(JobRecord job, List<String> dependsOnJobIds) {
+    public PlannedStep {
+      Objects.requireNonNull(job, "job");
+      dependsOnJobIds = dependsOnJobIds == null ? List.of() : List.copyOf(dependsOnJobIds);
+    }
+
+    public static PlannedStep independent(JobRecord job) {
+      return new PlannedStep(job, List.of());
+    }
+
+    public static PlannedStep after(JobRecord job, JobRecord... dependencies) {
+      return new PlannedStep(
+          job, java.util.Arrays.stream(dependencies).map(JobRecord::id).toList());
+    }
+  }
+
+  /**
+   * Creates a workflow whose stages run in order, with dependencies between steps inside a stage.
+   * A dependency must name a job listed earlier in the same stage, which also rules out cycles.
+   */
+  public Workflow createPlan(
+      String name, List<List<PlannedStep>> stages, Map<String, String> attributes) {
     if (name == null || name.isBlank()) throw new IllegalArgumentException("name is required");
-    List<List<JobRecord>> plan = List.copyOf(stages).stream().map(List::copyOf).toList();
-    if (plan.isEmpty() || plan.stream().anyMatch(List::isEmpty)) {
+    List<List<PlannedStep>> planned = List.copyOf(stages).stream().map(List::copyOf).toList();
+    if (planned.isEmpty() || planned.stream().anyMatch(List::isEmpty)) {
       throw new IllegalArgumentException("workflow stages must be non-empty");
     }
+    List<List<JobRecord>> plan =
+        planned.stream().map(stage -> stage.stream().map(PlannedStep::job).toList()).toList();
     String workflowId = UUID.randomUUID().toString();
     Instant now = Instant.now();
     int total = plan.stream().mapToInt(List::size).sum();
@@ -106,14 +143,27 @@ public final class WorkflowManager implements AutoCloseable, Consumer<Worker.Sta
     for (int index = 0; index < total; index++) ids.add(UUID.randomUUID().toString());
     List<WorkflowStep> steps = new ArrayList<>(total);
     int sequence = 0;
-    for (int stage = 0; stage < plan.size(); stage++) {
-      for (JobRecord job : plan.get(stage)) {
+    for (int stage = 0; stage < planned.size(); stage++) {
+      Map<String, String> stepIdsByJobId = new java.util.HashMap<>();
+      for (PlannedStep plannedStep : planned.get(stage)) {
+        JobRecord job = plannedStep.job();
+        List<String> dependsOn = new ArrayList<>();
+        for (String dependency : plannedStep.dependsOnJobIds()) {
+          String stepId = stepIdsByJobId.get(dependency);
+          if (stepId == null) {
+            throw new IllegalArgumentException(
+                "Job " + job.id() + " depends on " + dependency
+                    + ", which is not listed earlier in stage " + stage);
+          }
+          dependsOn.add(stepId);
+        }
         steps.add(
             new WorkflowStep(
                 ids.get(sequence), workflowId, now, now, job.id(), job, WorkflowStepStatus.PENDING,
                 null, null, sequence == 0 ? null : ids.get(sequence - 1),
                 sequence + 1 == total ? null : ids.get(sequence + 1), sequence, Map.of(), null,
-                stage));
+                stage, dependsOn));
+        stepIdsByJobId.put(job.id(), ids.get(sequence));
         sequence++;
       }
     }
@@ -129,13 +179,22 @@ public final class WorkflowManager implements AutoCloseable, Consumer<Worker.Sta
     return persisted;
   }
 
-  /** Stage shapes such as {@code STORE_INIT,STORE_PARTx80,STORE_COMPLETE,INDEX}. */
+  /**
+   * Stage shapes such as {@code STORE_INIT,STORE_PARTx80,STORE_COMPLETE,INDEX}; a stage mixing
+   * job types lists each, as in {@code STORE_INIT+BUFFER_CHUNKx80+STORE_CHUNKx80}.
+   */
   private static String describe(List<List<JobRecord>> plan) {
-    return plan.stream()
-        .map(stage -> stage.size() == 1
-            ? stage.get(0).type().name()
-            : stage.get(0).type().name() + "x" + stage.size())
-        .collect(Collectors.joining(","));
+    return plan.stream().map(WorkflowManager::describeJobs).collect(Collectors.joining(","));
+  }
+
+  private static String describeJobs(List<JobRecord> jobs) {
+    Map<JobRecord.JobType, Long> counts = jobs.stream().collect(
+        Collectors.groupingBy(JobRecord::type, java.util.LinkedHashMap::new, Collectors.counting()));
+    return counts.entrySet().stream()
+        .map(entry -> entry.getValue() == 1
+            ? entry.getKey().name()
+            : entry.getKey().name() + "x" + entry.getValue())
+        .collect(Collectors.joining("+"));
   }
 
   /** Called once for each workflow that transitions to {@link WorkflowStatus#CRASHED}. */
@@ -239,9 +298,21 @@ public final class WorkflowManager implements AutoCloseable, Consumer<Worker.Sta
   }
 
   private void submitReadySteps(Workflow workflow) {
+    // Computed once per pass: a chunked ingest puts thousands of steps in one stage.
+    Set<String> completed = new java.util.HashSet<>();
+    int firstIncompleteStage = Integer.MAX_VALUE;
+    for (WorkflowStep step : workflow.workflowSteps()) {
+      if (step.status() == WorkflowStepStatus.COMPLETED) {
+        completed.add(step.id());
+      } else {
+        firstIncompleteStage = Math.min(firstIncompleteStage, step.stage());
+      }
+    }
+    int openStage = firstIncompleteStage;
     List<WorkflowStep> ready = workflow.workflowSteps().stream()
         .filter(step -> step.status() == WorkflowStepStatus.PENDING)
-        .filter(step -> earlierStagesCompleted(workflow, step.stage()))
+        .filter(step -> step.stage() <= openStage)
+        .filter(step -> completed.containsAll(step.dependsOn()))
         .toList();
     if (ready.isEmpty()) return;
     // Enqueue first: a crash before the status write is repaired by recovery re-queuing
@@ -258,7 +329,8 @@ public final class WorkflowManager implements AutoCloseable, Consumer<Worker.Sta
       }
     }
     LOG.info("stage_submitted", "workflow", workflow.id(), "name", workflow.name(),
-        "stage", ready.get(0).stage(), "type", ready.get(0).jobRecord().type(),
+        "stage", ready.get(0).stage(),
+        "type", describeJobs(ready.stream().map(WorkflowStep::jobRecord).toList()),
         "steps", ready.size(), "priority", ready.get(0).jobRecord().priority(),
         "retry", workflow.retryAttempts());
   }
@@ -277,12 +349,6 @@ public final class WorkflowManager implements AutoCloseable, Consumer<Worker.Sta
         workflow.processStartAt() == null ? now : workflow.processStartAt(),
         workflow.processEndAt(), steps, workflow.attributes(), workflow.failureMessage(),
         workflow.retryAttempts(), workflow.nextRetryAt());
-  }
-
-  private static boolean earlierStagesCompleted(Workflow workflow, int stage) {
-    return workflow.workflowSteps().stream()
-        .filter(step -> step.stage() < stage)
-        .allMatch(step -> step.status() == WorkflowStepStatus.COMPLETED);
   }
 
   private static Workflow apply(
@@ -345,7 +411,8 @@ public final class WorkflowManager implements AutoCloseable, Consumer<Worker.Sta
       WorkflowStep step, WorkflowStepStatus status, Instant startedAt, Instant endedAt, String failure) {
     return new WorkflowStep(step.id(), step.workflowId(), step.createdAt(), Instant.now(),
         step.jobRecordId(), step.jobRecord(), status, startedAt, endedAt, step.prevStepId(),
-        step.nextStepId(), step.sequence(), step.attributes(), failure, step.stage());
+        step.nextStepId(), step.sequence(), step.attributes(), failure, step.stage(),
+        step.dependsOn());
   }
 
   private void notifyCrashed(Workflow workflow) {

@@ -111,7 +111,7 @@ public final class S3ObjectStore implements ObjectStore {
   public boolean verifiedMultipart(
       String tenantId, String key, long length, String sha256, String compositeSha256)
       throws IOException {
-    validateChecksum(sha256);
+    if (sha256 != null) validateChecksum(sha256);
     if (compositeSha256 == null || !compositeSha256.matches("[A-Za-z0-9+/]{43}=-[0-9]{1,5}")) {
       throw new IllegalArgumentException("A composite SHA-256 checksum is required");
     }
@@ -136,7 +136,7 @@ public final class S3ObjectStore implements ObjectStore {
     try {
       HeadObjectResponse response = s3.headObject(request.build());
       return response.contentLength() == length
-          && sha256.equals(response.metadata().get(SHA256_METADATA))
+          && (sha256 == null || sha256.equals(response.metadata().get(SHA256_METADATA)))
           && Checksum.sha256(tenantId).equals(response.metadata().get(TENANT_HASH_METADATA))
           && expectedChecksum.equals(response.checksumSHA256())
           && kmsEncrypted(response.serverSideEncryptionAsString())
@@ -174,7 +174,10 @@ public final class S3ObjectStore implements ObjectStore {
   public String createMultipartUpload(String tenantId, String key, String sha256)
       throws IOException {
     validateKey(tenantId, key);
-    validateChecksum(sha256);
+    if (sha256 != null) validateChecksum(sha256);
+    Map<String, String> metadata = sha256 == null
+        ? Map.of(TENANT_HASH_METADATA, Checksum.sha256(tenantId))
+        : Map.of(SHA256_METADATA, sha256, TENANT_HASH_METADATA, Checksum.sha256(tenantId));
     CreateMultipartUploadRequest.Builder request =
         CreateMultipartUploadRequest.builder()
             .bucket(configuration.bucket())
@@ -184,8 +187,7 @@ public final class S3ObjectStore implements ObjectStore {
             .bucketKeyEnabled(configuration.bucketKeyEnabled())
             .checksumAlgorithm(ChecksumAlgorithm.SHA256)
             .checksumType(ChecksumType.COMPOSITE)
-            .metadata(
-                Map.of(SHA256_METADATA, sha256, TENANT_HASH_METADATA, Checksum.sha256(tenantId)));
+            .metadata(metadata);
     expectedOwner(request::expectedBucketOwner);
     try {
       return s3.createMultipartUpload(request.build()).uploadId();

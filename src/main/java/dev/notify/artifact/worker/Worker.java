@@ -8,6 +8,7 @@ import dev.notify.artifact.store.JobStore;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
@@ -404,11 +405,18 @@ public final class Worker implements AutoCloseable {
     LOGGER.log(System.Logger.Level.INFO, "worker={0} event=stopped", id);
   }
 
+  /** The failure's message plus its root cause, which wrappers such as store errors hide. */
   private static String safeMessage(Exception failure) {
-    String message = failure.getMessage();
-    return message == null
-        ? failure.getClass().getSimpleName()
-        : message.substring(0, Math.min(500, message.length()));
+    String message = describe(failure);
+    Throwable root = failure;
+    while (root.getCause() != null && root.getCause() != root) root = root.getCause();
+    if (root != failure) message += " (caused by " + root.getClass().getSimpleName() + ": "
+        + describe(root) + ")";
+    return message.substring(0, Math.min(500, message.length()));
+  }
+
+  private static String describe(Throwable failure) {
+    return failure.getMessage() == null ? failure.getClass().getSimpleName() : failure.getMessage();
   }
 
   private record BufferedJob(
@@ -442,7 +450,8 @@ public final class Worker implements AutoCloseable {
 
   private static StateMachine<JobStateMachines.State> stateMachine(JobRecord.JobType type) {
     return switch (type) {
-      case INGEST, STORE, STORE_INIT, STORE_PART, STORE_COMPLETE, RELEASE_SPOOL ->
+      case INGEST, STORE, STORE_INIT, STORE_PART, STORE_COMPLETE, RELEASE_SPOOL, BUFFER_CHUNK,
+          SPOOL_CHUNK, STORE_CHUNK, INDEX_CHUNK, RELEASE_BUFFER, SPOOL_COMMIT, INDEX_FINAL ->
           new JobStateMachines.Ingest();
       case FETCH -> new JobStateMachines.Fetch();
       case INDEX -> new JobStateMachines.Index();
@@ -457,4 +466,51 @@ public final class Worker implements AutoCloseable {
       String jobId,
       JobRecord.JobType jobType,
       StateMachine.Transition<JobStateMachines.State> transition) {}
+      
+  public final class Buffer<T> {
+    private final int maxItems;
+    private final long maxBytes;
+    private final Duration maxAge;
+    private final List<T> items = new ArrayList<>();
+    private long bytes;
+    private long openedNanos;
+
+    public Buffer(int maxItems, long maxBytes, Duration maxAge) {
+      if (maxItems < 1 || maxBytes < 1 || maxAge == null || maxAge.isNegative() || maxAge.isZero()) {
+        throw new IllegalArgumentException("Buffer limits must be positive");
+      }
+      this.maxItems = maxItems;
+      this.maxBytes = maxBytes;
+      this.maxAge = maxAge;
+    }
+
+    public synchronized boolean add(T item, long size) {
+      if (item == null || size < 0) {
+        throw new IllegalArgumentException("Buffer item is required and size cannot be negative");
+      }
+      if (size > maxBytes || bytes + size > maxBytes || items.size() >= maxItems) {
+        return false;
+      }
+      if (items.isEmpty()) {
+        openedNanos = System.nanoTime();
+      }
+      items.add(item);
+      bytes += size;
+      return true;
+    }
+
+    public synchronized boolean shouldFlush() {
+      return items.size() >= maxItems
+          || bytes >= maxBytes
+          || (!items.isEmpty() && System.nanoTime() - openedNanos >= maxAge.toNanos());
+    }
+
+    public synchronized List<T> drain() {
+      var copy = List.copyOf(items);
+      items.clear();
+      bytes = 0;
+      openedNanos = 0;
+      return copy;
+    }
+  }
 }

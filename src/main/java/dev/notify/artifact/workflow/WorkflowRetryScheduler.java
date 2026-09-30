@@ -196,7 +196,7 @@ public final class WorkflowRetryScheduler implements AutoCloseable {
     return new WorkflowStep(step.id(), step.workflowId(), step.createdAt(), now, retryJobId,
         step.jobRecord().retryAs(retryJobId, now), WorkflowStepStatus.PENDING, null, null,
         step.prevStepId(), step.nextStepId(), step.sequence(), step.attributes(), null,
-        step.stage());
+        step.stage(), step.dependsOn());
   }
 
   private static Workflow copy(

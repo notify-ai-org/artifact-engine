@@ -60,6 +60,39 @@ public record Artifact(
         Instant.now());
   }
 
+  /** A provisional digest marks content that is still arriving; see {@link #hasContentDigest}. */
+  public static final String PENDING_DIGEST_PREFIX = "pending-";
+
+  /** False until a chunked ingest has committed its content and recorded the real SHA-256. */
+  public boolean hasContentDigest() {
+    return !sha256.startsWith(PENDING_DIGEST_PREFIX);
+  }
+
+  /** Records the SHA-256 of content that was committed after registration (chunked ingest). */
+  public Artifact withContentDigest(String contentSha256) {
+    return new Artifact(
+        id,
+        tenantId,
+        idempotencyKey,
+        idempotencyFingerprint,
+        sourceType,
+        sourceUri,
+        originalName,
+        mediaType,
+        sizeBytes,
+        java.util.Objects.requireNonNull(contentSha256, "contentSha256"),
+        storageKey,
+        spoolPath,
+        storageStatus,
+        indexStatus,
+        version,
+        metadata,
+        failureCode,
+        failureMessage,
+        createdAt,
+        Instant.now());
+  }
+
   /** The local spool copy was released; the object store holds the only copy from now on. */
   public Artifact withoutSpool() {
     return new Artifact(

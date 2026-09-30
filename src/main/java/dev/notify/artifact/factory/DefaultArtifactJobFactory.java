@@ -4,6 +4,8 @@ import dev.notify.artifact.EngineOptions;
 import dev.notify.artifact.auth.AuthorizationService;
 import dev.notify.artifact.auth.ArtifactAccessVerifier;
 import dev.notify.artifact.auth.DataVerifier;
+import dev.notify.artifact.cache.RetrievalResultCache;
+import dev.notify.artifact.chunk.ChunkedIngestSupport;
 import dev.notify.artifact.embed.EmbeddingService;
 import dev.notify.artifact.job.DeleteJob;
 import dev.notify.artifact.job.FetchJob;
@@ -12,6 +14,7 @@ import dev.notify.artifact.job.Job;
 import dev.notify.artifact.job.ListMetadataJob;
 import dev.notify.artifact.job.MetadataJob;
 import dev.notify.artifact.job.RetrievalJob;
+import dev.notify.artifact.job.SourceIngestJob;
 import dev.notify.artifact.model.Artifact;
 import dev.notify.artifact.model.Requests;
 import dev.notify.artifact.spool.DurableSpool;
@@ -33,6 +36,8 @@ public final class DefaultArtifactJobFactory implements ArtifactJobFactory {
   private final ArtifactAccessVerifier accessVerifier;
   private final EngineOptions options;
   private final WorkflowManager workflowManager;
+  private final ChunkedIngestSupport chunkedIngest;
+  private final RetrievalResultCache retrievalCache;
 
   public DefaultArtifactJobFactory(
       MetadataStore metadataStore,
@@ -57,6 +62,46 @@ public final class DefaultArtifactJobFactory implements ArtifactJobFactory {
       AuthorizationService authorizationService,
       EngineOptions options,
       WorkflowManager workflowManager) {
+    this(metadataStore, vectorStore, objectStore, durableSpool, dataVerifier, embeddingService,
+        authorizationService, options, workflowManager, null);
+  }
+
+  /**
+   * @param chunkedIngest enables {@link #createSourceIngest}; requires a workflow manager
+   */
+  public DefaultArtifactJobFactory(
+      MetadataStore metadataStore,
+      VectorStore vectorStore,
+      ObjectStore objectStore,
+      DurableSpool durableSpool,
+      DataVerifier dataVerifier,
+      EmbeddingService embeddingService,
+      AuthorizationService authorizationService,
+      EngineOptions options,
+      WorkflowManager workflowManager,
+      ChunkedIngestSupport chunkedIngest) {
+    this(metadataStore, vectorStore, objectStore, durableSpool, dataVerifier, embeddingService,
+        authorizationService, options, workflowManager, chunkedIngest, null);
+  }
+
+  /** @param retrievalCache optional search result cache used by {@link #createRetrieval} */
+  public DefaultArtifactJobFactory(
+      MetadataStore metadataStore,
+      VectorStore vectorStore,
+      ObjectStore objectStore,
+      DurableSpool durableSpool,
+      DataVerifier dataVerifier,
+      EmbeddingService embeddingService,
+      AuthorizationService authorizationService,
+      EngineOptions options,
+      WorkflowManager workflowManager,
+      ChunkedIngestSupport chunkedIngest,
+      RetrievalResultCache retrievalCache) {
+    this.retrievalCache = retrievalCache;
+    if (chunkedIngest != null && workflowManager == null) {
+      throw new IllegalArgumentException("Chunked ingest requires a workflow manager");
+    }
+    this.chunkedIngest = chunkedIngest;
     this.metadataStore = Objects.requireNonNull(metadataStore, "metadataStore");
     this.vectorStore = Objects.requireNonNull(vectorStore, "vectorStore");
     this.objectStore = Objects.requireNonNull(objectStore, "objectStore");
@@ -79,6 +124,15 @@ public final class DefaultArtifactJobFactory implements ArtifactJobFactory {
         accessVerifier,
         options,
         workflowManager);
+  }
+
+  @Override
+  public Job<Artifact> createSourceIngest(Requests.IngestSource request) {
+    if (chunkedIngest == null) {
+      throw new UnsupportedOperationException("Source ingest is not configured");
+    }
+    return new SourceIngestJob(
+        request, metadataStore, durableSpool, accessVerifier, chunkedIngest, workflowManager);
   }
 
   @Override
@@ -131,7 +185,8 @@ public final class DefaultArtifactJobFactory implements ArtifactJobFactory {
         vectorStore,
         embeddingService,
         accessVerifier,
-        options);
+        options,
+        retrievalCache);
   }
 
   @Override

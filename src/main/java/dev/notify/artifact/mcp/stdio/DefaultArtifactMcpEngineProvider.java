@@ -20,7 +20,10 @@ import dev.notify.artifact.embed.OkHttpEmbeddingProvider;
 import dev.notify.artifact.environment.Environment;
 import dev.notify.artifact.factory.DefaultArtifactJobFactory;
 import dev.notify.artifact.retry.RetryPolicy;
+import dev.notify.artifact.cache.QueryEmbeddingCache;
+import dev.notify.artifact.cache.RetrievalResultCache;
 import dev.notify.artifact.extract.TextExtractorFactory;
+import dev.notify.artifact.store.InvalidatingMetadataStore;
 import dev.notify.artifact.jdbc.JdbiJobStore;
 import dev.notify.artifact.jdbc.JdbiMetadataStore;
 import dev.notify.artifact.jdbc.JdbiMultipartUploadStore;
@@ -145,6 +148,12 @@ public final class DefaultArtifactMcpEngineProvider implements ArtifactMcpEngine
       throw new IllegalStateException("Unable to initialize the artifact spool", exception);
     }
 
+    // Search results are cached per tenant and dropped whenever an artifact's visibility changes.
+    RetrievalResultCache retrievalCache = new RetrievalResultCache(
+        positiveLong(environment, "ARTIFACT_RETRIEVAL_CACHE_MAX_BYTES", 64L * 1024 * 1024),
+        Duration.ofSeconds(positiveLong(environment, "ARTIFACT_RETRIEVAL_CACHE_TTL_SECONDS", 300)));
+    metadata = new InvalidatingMetadataStore(metadata, retrievalCache::invalidateTenant);
+
     // Background processing: a durable queue per job type, workers that execute workflow steps,
     // and the workflow manager that submits them stage by stage.
     SpoolReleaser spoolReleaser = new SpoolReleaser(metadata, spool);
@@ -210,7 +219,9 @@ public final class DefaultArtifactMcpEngineProvider implements ArtifactMcpEngine
                 true,
                 4,
                 nonNegativeLong(environment, "ARTIFACT_STORE_MULTIPART_PART_BYTES", 64L * 1024 * 1024)),
-            workflowManager);
+            workflowManager,
+            null,
+            retrievalCache);
     directJobWorker = new dev.notify.artifact.worker.DirectJobWorker(4, 256);
     JobDispatcher directDispatcher =
         new dev.notify.artifact.dispatcher.DirectJobDispatcher(directJobWorker);
@@ -470,7 +481,11 @@ public final class DefaultArtifactMcpEngineProvider implements ArtifactMcpEngine
             positiveInt(environment, "EMBEDDING_MAX_BATCH_SIZE", 32),
             Duration.ofMillis(positiveLong(environment, "EMBEDDING_MAX_WAIT_MILLIS", 25)),
             cacheTtl,
-            RetryPolicy.defaults()),
+            RetryPolicy.defaults(),
+            new QueryEmbeddingCache(
+                positiveLong(environment, "ARTIFACT_QUERY_CACHE_MAX_BYTES", 32L * 1024 * 1024),
+                Duration.ofSeconds(
+                    positiveLong(environment, "ARTIFACT_QUERY_CACHE_TTL_SECONDS", 3600)))),
         client);
   }
 

@@ -3,6 +3,7 @@ package dev.notify.artifact.job;
 import dev.notify.artifact.EngineOptions;
 import dev.notify.artifact.auth.ArtifactAccessVerifier;
 import dev.notify.artifact.auth.AuthorizationService;
+import dev.notify.artifact.cache.RetrievalResultCache;
 import dev.notify.artifact.embed.EmbeddingService;
 import dev.notify.artifact.model.Artifact;
 import dev.notify.artifact.model.ArtifactChunk;
@@ -27,6 +28,7 @@ public final class RetrievalJob extends AbstractJob<List<Requests.SearchHit>>
   private final EmbeddingService embeddingService;
   private final ArtifactAccessVerifier accessVerifier;
   private final EngineOptions options;
+  private final RetrievalResultCache resultCache;
 
   public RetrievalJob(
       Requests.Search request,
@@ -35,7 +37,20 @@ public final class RetrievalJob extends AbstractJob<List<Requests.SearchHit>>
       EmbeddingService embeddingService,
       ArtifactAccessVerifier accessVerifier,
       EngineOptions options) {
+    this(request, metadataStore, vectorStore, embeddingService, accessVerifier, options, null);
+  }
+
+  /** @param resultCache optional; consulted only after the caller is authorized to search */
+  public RetrievalJob(
+      Requests.Search request,
+      MetadataStore metadataStore,
+      VectorStore vectorStore,
+      EmbeddingService embeddingService,
+      ArtifactAccessVerifier accessVerifier,
+      EngineOptions options,
+      RetrievalResultCache resultCache) {
     super(accessVerifier, metadataStore);
+    this.resultCache = resultCache;
     this.request = request;
     this.vectorStore = vectorStore;
     this.embeddingService = embeddingService;
@@ -46,8 +61,11 @@ public final class RetrievalJob extends AbstractJob<List<Requests.SearchHit>>
   @Override
   public List<Requests.SearchHit> execute() {
     verify(null, null);
+    return resultCache == null ? search() : resultCache.get(request, this::search);
+  }
 
-    float[] queryEmbedding = embeddingService.embed(List.of(request.query())).get(0);
+  private List<Requests.SearchHit> search() {
+    float[] queryEmbedding = embeddingService.embedQuery(request.query());
     int candidateLimit = request.limit() * options.retrievalCandidateMultiplier();
     VectorStore.SearchFilter storeFilter =
         new VectorStore.SearchFilter(request.mediaTypes(), request.tags());

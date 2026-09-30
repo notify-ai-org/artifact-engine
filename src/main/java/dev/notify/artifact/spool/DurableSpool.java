@@ -28,6 +28,7 @@ import java.util.UUID;
 public final class DurableSpool {
   private static final int COPY_BUFFER_BYTES = 64 * 1024;
   private static final String CONTENT_FILE = "content.pending";
+  private static final String PARTIAL_FILE = "content.partial";
   private static final String METADATA_FILE = "metadata.json";
   private static final String SCRATCH_DIRECTORY = ".scratch";
 
@@ -86,6 +87,103 @@ public final class DurableSpool {
 
   public InputStream open(Path path) throws IOException {
     return Files.newInputStream(requireContentPath(path));
+  }
+
+  // ---- Chunked entries: content that arrives as independently written byte ranges ----------
+
+  /**
+   * Reserves quota and a sparse file of the full length for content that will be written in
+   * chunks. Returns the path the content will have once {@link #commit committed}; until then the
+   * bytes live in a sibling partial file that readers never see.
+   */
+  public Path reserve(String tenantId, String artifactId, long length, Map<String, ?> metadata)
+      throws IOException {
+    if (length < 1) throw new IllegalArgumentException("Chunked content cannot be empty");
+    if (length > limits.maxArtifactBytes()) {
+      throw new SpoolQuotaExceededException("Artifact exceeds the configured byte limit");
+    }
+    String tenantHash = Checksum.sha256(tenantId);
+    Path directory = safeDirectory(tenantHash, artifactId);
+    Files.createDirectories(directory);
+    Path partial = directory.resolve(PARTIAL_FILE);
+    reserveFile(tenantHash);
+    boolean bytesReserved = false;
+    try {
+      reserveBytes(tenantHash, length);
+      bytesReserved = true;
+      try (var file = new java.io.RandomAccessFile(partial.toFile(), "rw")) {
+        file.setLength(length);
+      }
+      publishMetadata(directory, metadata);
+      return directory.resolve(CONTENT_FILE);
+    } catch (IOException | RuntimeException failure) {
+      Files.deleteIfExists(partial);
+      Files.deleteIfExists(directory.resolve(METADATA_FILE));
+      release(tenantHash, bytesReserved ? length : 0, 1);
+      deleteDirectoryIfEmpty(directory);
+      throw failure;
+    }
+  }
+
+  /**
+   * Writes one chunk at its offset and flushes it to disk. A no-op once the entry is committed, so
+   * a retried chunk job after commit is harmless.
+   */
+  public void writeChunk(Path contentPath, long offset, java.nio.ByteBuffer data)
+      throws IOException {
+    Path content = requireContentPath(contentPath);
+    if (Files.exists(content)) return;
+    Path partial = content.resolveSibling(PARTIAL_FILE);
+    try (FileChannel channel = FileChannel.open(partial, StandardOpenOption.WRITE)) {
+      java.nio.ByteBuffer source = data.duplicate();
+      if (offset < 0 || offset + source.remaining() > channel.size()) {
+        throw new IOException("Chunk at " + offset + " does not fit the reserved length");
+      }
+      long position = offset;
+      while (source.hasRemaining()) {
+        position += channel.write(source, position);
+      }
+      channel.force(false);
+    }
+  }
+
+  /**
+   * Verifies the length, hashes the content, and atomically publishes it. Idempotent: committing
+   * an already committed entry returns the same result.
+   */
+  public SpoolEntry commit(Path contentPath, long expectedLength) throws IOException {
+    Path content = requireContentPath(contentPath);
+    if (!Files.exists(content)) {
+      Path partial = content.resolveSibling(PARTIAL_FILE);
+      long size = Files.size(partial);
+      if (size != expectedLength) {
+        throw new IOException("Spooled " + size + " bytes but expected " + expectedLength);
+      }
+      forceFile(partial);
+      Files.move(partial, content, StandardCopyOption.ATOMIC_MOVE);
+    }
+    String sha256;
+    try (InputStream input = Files.newInputStream(content)) {
+      sha256 = Checksum.sha256(input);
+    }
+    return new SpoolEntry(content, Files.size(content), sha256);
+  }
+
+  /** Discards a reserved (possibly committed) chunked entry and releases its quota. */
+  public void discardReserved(Path contentPath) throws IOException {
+    Path content = requireContentPath(contentPath);
+    Path partial = content.resolveSibling(PARTIAL_FILE);
+    if (Files.exists(content)) {
+      discard(content);
+      Files.deleteIfExists(partial);
+      return;
+    }
+    long size = Files.exists(partial) ? Files.size(partial) : 0;
+    String tenantHash = content.getParent().getParent().getFileName().toString();
+    Files.deleteIfExists(partial);
+    Files.deleteIfExists(content.getParent().resolve(METADATA_FILE));
+    deleteDirectoryIfEmpty(content.getParent());
+    if (size > 0) release(tenantHash, size, 1);
   }
 
   /** Opens {@code length} bytes of a spool entry starting at {@code offset}. */
@@ -285,8 +383,14 @@ public final class DurableSpool {
     }
   }
 
+  /** Counts published entries and reserved chunked entries, whose quota is held up front. */
   private void rebuildUsage() throws IOException {
-    for (Path content : entries()) {
+    List<Path> held;
+    try (var paths = Files.find(root, 3, (path, attributes) -> attributes.isRegularFile())) {
+      held = paths.filter(path -> path.getFileName().toString().equals(CONTENT_FILE)
+          || path.getFileName().toString().equals(PARTIAL_FILE)).toList();
+    }
+    for (Path content : held) {
       String tenantHash = content.getParent().getParent().getFileName().toString();
       long size = Files.size(content);
       totalBytes += size;

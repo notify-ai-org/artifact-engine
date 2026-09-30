@@ -249,7 +249,10 @@ public final class JdbiWorkflowStore implements WorkflowStore {
             resultSet.getString("attributes_json"), new TypeReference<Map<String, String>>() {},
             "step attributes"),
         resultSet.getString("failure_message"),
-        resultSet.getInt("stage"));
+        resultSet.getInt("stage"),
+        deserializeValue(
+            resultSet.getString("depends_on_json"), new TypeReference<List<String>>() {},
+            "step dependencies"));
   }
 
   private static Instant instant(ResultSet resultSet, String column) throws SQLException {
@@ -298,6 +301,7 @@ public final class JdbiWorkflowStore implements WorkflowStore {
             updated_at = :updatedAt, job_record_id = :jobId, status = :status,
             process_start_at = :startAt, process_end_at = :endAt, prev_step_id = :prevStepId,
             next_step_id = :nextStepId, step_order = :stepOrder, stage = :stage,
+            depends_on_json = :dependsOnJson,
             attributes_json = :attributesJson, failure_message = :failureMessage
           WHERE id = :id AND workflow_id = :workflowId
           """);
@@ -318,11 +322,11 @@ public final class JdbiWorkflowStore implements WorkflowStore {
         INSERT INTO artifact_workflow_step
           (id, workflow_id, created_at, updated_at, job_record_id,
            status, process_start_at, process_end_at, prev_step_id, next_step_id,
-           step_order, stage, attributes_json, failure_message)
+           step_order, stage, depends_on_json, attributes_json, failure_message)
         VALUES
           (:id, :workflowId, :createdAt, :updatedAt, :jobId,
            :status, :startAt, :endAt, :prevStepId, :nextStepId,
-           :stepOrder, :stage, :attributesJson, :failureMessage)
+           :stepOrder, :stage, :dependsOnJson, :attributesJson, :failureMessage)
         """);
     steps.forEach(step -> bindStep(batch, workflowId, step).add());
     batch.execute();
@@ -346,6 +350,7 @@ public final class JdbiWorkflowStore implements WorkflowStore {
         .bind("nextStepId", step.nextStepId())
         .bind("stepOrder", step.sequence())
         .bind("stage", step.stage())
+        .bind("dependsOnJson", serializeValue(step.dependsOn(), "Workflow step dependencies"))
         .bind("attributesJson", serializeValue(step.attributes(), "Workflow step attributes"))
         .bind("failureMessage", step.failureMessage());
   }

@@ -43,6 +43,33 @@ class ChunkerTest {
   }
 
   @Test
+  void snapshotAndResumeAcrossPiecesMatchesOneUninterruptedSession() throws Exception {
+    Random random = new Random(7);
+    for (int trial = 0; trial < 300; trial++) {
+      String text = randomText(random, random.nextInt(80));
+      Chunker chunker = new Chunker(5, 2);
+      List<String> expected = chunker.chunk(text);
+
+      List<String> streamed = new ArrayList<>();
+      Chunker.ChunkConsumer collect = (index, chunk) -> {
+        assertEquals(streamed.size(), index);
+        streamed.add(chunk);
+      };
+      Chunker.State state = Chunker.State.INITIAL;
+      for (int start = 0; start < text.length(); ) {
+        int end = Math.min(text.length(), start + 1 + random.nextInt(9));
+        Chunker.Session session = chunker.resume(state, collect);
+        session.accept(text.substring(start, end));
+        state = session.snapshot();
+        start = end;
+      }
+      chunker.resume(state, collect).finish();
+
+      assertEquals(expected, streamed, () -> "resumed(" + text + ")");
+    }
+  }
+
+  @Test
   void keepsNonAsciiWhitespaceInsideWordsLikeTheLegacyRegex() {
     assertEquals(List.of("a b c"), new Chunker(5, 0).chunk("a b   c"));
   }

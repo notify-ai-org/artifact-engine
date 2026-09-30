@@ -98,6 +98,11 @@ public final class DefaultArtifactEngine implements ArtifactEngine {
   }
 
   @Override
+  public Artifact ingestFromSource(Requests.IngestSource request) throws IOException {
+    return dispatchIo(jobFactory.createSourceIngest(request), "source ingest");
+  }
+
+  @Override
   public Artifact metadata(String principalId, String tenantId, String artifactId) {
     return dispatch(jobFactory.createMetadata(principalId, tenantId, artifactId), "metadata");
   }

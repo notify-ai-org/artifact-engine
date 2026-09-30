@@ -29,6 +29,29 @@ public final class Requests {
     }
   }
 
+  /**
+   * Ingest from a location the engine reads itself, in independent byte ranges: an {@code
+   * http(s)} URL whose server supports range requests, or a {@code file:} URI under an allowed
+   * root. Content is streamed chunk by chunk through a bounded buffer pool.
+   *
+   * @param originalName display name; derived from the location when null
+   */
+  public record IngestSource(
+      String tenantId,
+      String principalId,
+      String idempotencyKey,
+      String location,
+      String originalName,
+      String declaredMediaType,
+      Map<String, String> metadata) {
+    public IngestSource {
+      requireText(tenantId, "tenantId");
+      requireText(principalId, "principalId");
+      requireText(location, "location");
+      metadata = metadata == null ? Map.of() : Map.copyOf(metadata);
+    }
+  }
+
   public record Search(
       String tenantId,
       String principalId,
