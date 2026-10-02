@@ -1,4 +1,4 @@
-package dev.notify.artifact.jdbc;
+package dev.notify.artifact.store.jdbc;
 
 import dev.notify.artifact.store.MultipartUploadStore;
 import java.sql.ResultSet;

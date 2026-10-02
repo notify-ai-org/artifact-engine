@@ -1,4 +1,4 @@
-package dev.notify.artifact.jdbc;
+package dev.notify.artifact.store.jdbc;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
