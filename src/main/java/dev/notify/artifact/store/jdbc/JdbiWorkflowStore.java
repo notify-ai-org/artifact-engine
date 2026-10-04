@@ -228,7 +228,7 @@ public final class JdbiWorkflowStore implements WorkflowStore {
     return new Workflow(
         workflow.id(), workflow.name(), workflow.createdAt(), workflow.updatedAt(), workflow.status(),
         workflow.processStartAt(), workflow.processEndAt(), steps, workflow.attributes(),
-        workflow.failureMessage());
+        workflow.failureMessage(), workflow.retryAttempts(), workflow.nextRetryAt());
   }
 
   private WorkflowStep mapStep(ResultSet resultSet) throws SQLException {
