@@ -117,6 +117,21 @@ public final class InMemoryStores {
           .toList();
     }
 
+    @Override
+    public List<Artifact> awaitingStorage(int limit) {
+      return artifacts.values().stream()
+          .filter(artifact -> artifact.spoolPath() != null)
+          .filter(
+              artifact ->
+                  switch (artifact.storageStatus()) {
+                    case SPOOLED, UPLOADING, RETRY_PENDING -> true;
+                    default -> false;
+                  })
+          .sorted(Comparator.comparing(Artifact::createdAt))
+          .limit(Math.max(0, limit))
+          .toList();
+    }
+
   }
   public static final class Vectors implements VectorStore {
     private final Map<String, ArtifactChunk> chunks = new ConcurrentHashMap<>();

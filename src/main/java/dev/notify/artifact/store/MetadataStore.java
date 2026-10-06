@@ -26,6 +26,12 @@ public interface MetadataStore extends Store<Artifact> {
 
   List<Artifact> list(String tenantId, int limit);
 
+  /**
+   * Artifacts across all tenants whose spool copy is still the only copy: spooled, uploading, or
+   * waiting to retry the upload. Oldest first.
+   */
+  List<Artifact> awaitingStorage(int limit);
+
   record Registration(Outcome outcome, Artifact artifact) {
     public enum Outcome {
       CREATED,

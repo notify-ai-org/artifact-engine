@@ -196,6 +196,24 @@ public final class JdbiMetadataStore implements MetadataStore {
                 .list());
   }
 
+  @Override
+  public List<Artifact> awaitingStorage(int limit) {
+    return jdbi.withHandle(
+        handle ->
+            handle
+                .createQuery(
+                    """
+                    SELECT payload_json FROM artifact
+                    WHERE spool_path IS NOT NULL
+                      AND storage_status IN ('SPOOLED', 'UPLOADING', 'RETRY_PENDING')
+                    ORDER BY created_at LIMIT :limit
+                    """)
+                .bind("limit", boundedLimit(limit))
+                .mapTo(String.class)
+                .map(this::deserializeArtifact)
+                .list());
+  }
+
   private int insert(Handle handle, Artifact artifact) {
     return bindArtifact(
             handle.createUpdate(

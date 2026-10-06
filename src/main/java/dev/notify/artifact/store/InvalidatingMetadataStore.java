@@ -78,4 +78,9 @@ public final class InvalidatingMetadataStore implements MetadataStore {
   public List<Artifact> list(String tenantId, int limit) {
     return delegate.list(tenantId, limit);
   }
+
+  @Override
+  public List<Artifact> awaitingStorage(int limit) {
+    return delegate.awaitingStorage(limit);
+  }
 }
