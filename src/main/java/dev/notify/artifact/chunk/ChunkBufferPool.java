@@ -172,11 +172,18 @@ public final class ChunkBufferPool implements AutoCloseable {
   /** Periodically recycles idle chunks, so buffers of abandoned workflows cannot pin memory. */
   public synchronized void startIdleSweeper(Duration interval) {
     if (sweeper != null) return;
-    sweeper = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(runnable -> {
-      Thread thread = new Thread(runnable, "chunk-buffer-sweeper");
-      thread.setDaemon(true);
-      return thread;
-    });
+    startIdleSweeper(interval, defaultSweeper());
+  }
+
+  /**
+   * @param executor runs the sweep; the pool takes ownership and shuts it down on close. Ignored
+   *     (and left running) if a sweeper was already started.
+   */
+  public synchronized void startIdleSweeper(
+      Duration interval, java.util.concurrent.ScheduledExecutorService executor) {
+    java.util.Objects.requireNonNull(executor, "executor");
+    if (sweeper != null) return;
+    sweeper = executor;
     sweeper.scheduleWithFixedDelay(() -> {
       try {
         evictIdle();
@@ -184,6 +191,15 @@ public final class ChunkBufferPool implements AutoCloseable {
         LOG.warn("chunk_buffer_sweep_failed", failure);
       }
     }, interval.toMillis(), interval.toMillis(), java.util.concurrent.TimeUnit.MILLISECONDS);
+  }
+
+  /** A single daemon thread. */
+  public static java.util.concurrent.ScheduledExecutorService defaultSweeper() {
+    return java.util.concurrent.Executors.newSingleThreadScheduledExecutor(runnable -> {
+      Thread thread = new Thread(runnable, "chunk-buffer-sweeper");
+      thread.setDaemon(true);
+      return thread;
+    });
   }
 
   @Override

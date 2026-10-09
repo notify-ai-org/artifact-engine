@@ -1,6 +1,5 @@
 package dev.notify.artifact.job;
 
-import dev.notify.artifact.EngineOptions;
 import dev.notify.artifact.auth.ArtifactAccessVerifier;
 import dev.notify.artifact.auth.AuthorizationService;
 import dev.notify.artifact.model.Artifact;
@@ -31,7 +30,8 @@ public final class IngestJob extends AbstractJob<Artifact> implements DirectJob<
   private final Requests.Ingest request;
   private final DurableSpool durableSpool;
   private final ArtifactAccessVerifier accessVerifier;
-  private final EngineOptions options;
+  private final boolean deduplicateContent;
+  private final long multipartPartBytes;
   private final WorkflowManager workflowManager;
   private final AtomicBoolean claimed = new AtomicBoolean();
   private volatile DurableSpool.SpoolEntry spoolEntry;
@@ -42,22 +42,31 @@ public final class IngestJob extends AbstractJob<Artifact> implements DirectJob<
       MetadataStore metadataStore,
       DurableSpool durableSpool,
       ArtifactAccessVerifier accessVerifier,
-      EngineOptions options) {
-    this(request, metadataStore, durableSpool, accessVerifier, options, null);
+      boolean deduplicateContent,
+      long multipartPartBytes) {
+    this(request, metadataStore, durableSpool, accessVerifier, deduplicateContent,
+        multipartPartBytes, null);
   }
 
+  /**
+   * @param deduplicateContent reuse an existing artifact with the same content
+   * @param multipartPartBytes part size for multipart object uploads; {@code 0} stores every
+   *     artifact with a single upload
+   */
   public IngestJob(
       Requests.Ingest request,
       MetadataStore metadataStore,
       DurableSpool durableSpool,
       ArtifactAccessVerifier accessVerifier,
-      EngineOptions options,
+      boolean deduplicateContent,
+      long multipartPartBytes,
       WorkflowManager workflowManager) {
     super(accessVerifier, metadataStore);
     this.request = request;
     this.durableSpool = durableSpool;
     this.accessVerifier = accessVerifier;
-    this.options = options;
+    this.deduplicateContent = deduplicateContent;
+    this.multipartPartBytes = multipartPartBytes;
     this.workflowManager = workflowManager;
   }
 
@@ -179,10 +188,9 @@ public final class IngestJob extends AbstractJob<Artifact> implements DirectJob<
             now,
             now);
     try {
-      List<List<JobRecord>> stages = initialStages(artifact, options.multipartPartBytes());
+      List<List<JobRecord>> stages = initialStages(artifact, multipartPartBytes);
       MetadataStore.Registration registration =
-          metadataStore.register(
-              artifact, options.deduplicateContent());
+          metadataStore.register(artifact, deduplicateContent);
       String workflowId = null;
       if (registration.outcome() == MetadataStore.Registration.Outcome.CREATED
           && workflowManager != null) {

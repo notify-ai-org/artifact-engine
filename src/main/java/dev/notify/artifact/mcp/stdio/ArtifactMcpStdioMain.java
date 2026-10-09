@@ -1,6 +1,7 @@
 package dev.notify.artifact.mcp.stdio;
 
 import dev.notify.artifact.ArtifactEngine;
+import dev.notify.artifact.DefaultArtifactMcpEngineProvider;
 import dev.notify.artifact.environment.CommandLineEnvironmentSource;
 import dev.notify.artifact.environment.Environment;
 import dev.notify.artifact.environment.PropertiesFileEnvironmentSource;

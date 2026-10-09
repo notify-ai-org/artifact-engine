@@ -1,12 +1,12 @@
 package dev.notify.artifact.factory;
 
-import dev.notify.artifact.EngineOptions;
 import dev.notify.artifact.auth.AuthorizationService;
 import dev.notify.artifact.auth.ArtifactAccessVerifier;
 import dev.notify.artifact.auth.DataVerifier;
 import dev.notify.artifact.cache.RetrievalResultCache;
 import dev.notify.artifact.chunk.ChunkedIngestSupport;
 import dev.notify.artifact.embed.EmbeddingService;
+import dev.notify.artifact.environment.Environment;
 import dev.notify.artifact.job.DeleteJob;
 import dev.notify.artifact.job.FetchJob;
 import dev.notify.artifact.job.IngestJob;
@@ -34,7 +34,26 @@ public final class DefaultArtifactJobFactory implements ArtifactJobFactory {
   private final DurableSpool durableSpool;
   private final EmbeddingService embeddingService;
   private final ArtifactAccessVerifier accessVerifier;
-  private final EngineOptions options;
+  /** {@code true} (default) or {@code false}: reuse an existing artifact with the same content. */
+  public static final String DEDUPLICATE_CONTENT = "ARTIFACT_DEDUPLICATE_CONTENT";
+
+  /** 1 to 100, default 4: candidates fetched per requested search hit before filtering. */
+  public static final String RETRIEVAL_CANDIDATE_MULTIPLIER =
+      "ARTIFACT_RETRIEVAL_CANDIDATE_MULTIPLIER";
+
+  /**
+   * Part size for multipart object uploads, default 64 MiB. Artifacts larger than one part are
+   * stored as a multipart upload with parts uploaded in parallel. {@code 0} disables it and every
+   * artifact is stored with a single upload.
+   */
+  public static final String MULTIPART_PART_BYTES = "ARTIFACT_STORE_MULTIPART_PART_BYTES";
+
+  /** S3 rejects non-final parts smaller than 5 MiB. */
+  public static final long MIN_PART_BYTES = 5L * 1024 * 1024;
+
+  private final boolean deduplicateContent;
+  private final int retrievalCandidateMultiplier;
+  private final long multipartPartBytes;
   private final WorkflowManager workflowManager;
   private final ChunkedIngestSupport chunkedIngest;
   private final RetrievalResultCache retrievalCache;
@@ -47,9 +66,9 @@ public final class DefaultArtifactJobFactory implements ArtifactJobFactory {
       DataVerifier dataVerifier,
       EmbeddingService embeddingService,
       AuthorizationService authorizationService,
-      EngineOptions options) {
+      Environment environment) {
     this(metadataStore, vectorStore, objectStore, durableSpool, dataVerifier, embeddingService,
-        authorizationService, options, null);
+        authorizationService, environment, null);
   }
 
   public DefaultArtifactJobFactory(
@@ -60,10 +79,10 @@ public final class DefaultArtifactJobFactory implements ArtifactJobFactory {
       DataVerifier dataVerifier,
       EmbeddingService embeddingService,
       AuthorizationService authorizationService,
-      EngineOptions options,
+      Environment environment,
       WorkflowManager workflowManager) {
     this(metadataStore, vectorStore, objectStore, durableSpool, dataVerifier, embeddingService,
-        authorizationService, options, workflowManager, null);
+        authorizationService, environment, workflowManager, null);
   }
 
   /**
@@ -77,11 +96,11 @@ public final class DefaultArtifactJobFactory implements ArtifactJobFactory {
       DataVerifier dataVerifier,
       EmbeddingService embeddingService,
       AuthorizationService authorizationService,
-      EngineOptions options,
+      Environment environment,
       WorkflowManager workflowManager,
       ChunkedIngestSupport chunkedIngest) {
     this(metadataStore, vectorStore, objectStore, durableSpool, dataVerifier, embeddingService,
-        authorizationService, options, workflowManager, chunkedIngest, null);
+        authorizationService, environment, workflowManager, chunkedIngest, null);
   }
 
   /** @param retrievalCache optional search result cache used by {@link #createRetrieval} */
@@ -93,7 +112,7 @@ public final class DefaultArtifactJobFactory implements ArtifactJobFactory {
       DataVerifier dataVerifier,
       EmbeddingService embeddingService,
       AuthorizationService authorizationService,
-      EngineOptions options,
+      Environment environment,
       WorkflowManager workflowManager,
       ChunkedIngestSupport chunkedIngest,
       RetrievalResultCache retrievalCache) {
@@ -111,7 +130,10 @@ public final class DefaultArtifactJobFactory implements ArtifactJobFactory {
     this.accessVerifier =
         new ArtifactAccessVerifier(
             Objects.requireNonNull(authorizationService, "authorizationService"), dataVerifier);
-    this.options = Objects.requireNonNull(options, "options");
+    Objects.requireNonNull(environment, "environment");
+    this.deduplicateContent = deduplicateContent(environment);
+    this.retrievalCandidateMultiplier = retrievalCandidateMultiplier(environment);
+    this.multipartPartBytes = multipartPartBytes(environment);
     this.workflowManager = workflowManager;
   }
 
@@ -122,7 +144,8 @@ public final class DefaultArtifactJobFactory implements ArtifactJobFactory {
         metadataStore,
         durableSpool,
         accessVerifier,
-        options,
+        deduplicateContent,
+        multipartPartBytes,
         workflowManager);
   }
 
@@ -185,7 +208,7 @@ public final class DefaultArtifactJobFactory implements ArtifactJobFactory {
         vectorStore,
         embeddingService,
         accessVerifier,
-        options,
+        retrievalCandidateMultiplier,
         retrievalCache);
   }
 
@@ -200,5 +223,44 @@ public final class DefaultArtifactJobFactory implements ArtifactJobFactory {
         objectStore,
         durableSpool,
         accessVerifier);
+  }
+
+  private static boolean deduplicateContent(Environment environment) {
+    String value = property(environment, DEDUPLICATE_CONTENT);
+    if (value == null || "true".equalsIgnoreCase(value)) return true;
+    if ("false".equalsIgnoreCase(value)) return false;
+    throw new IllegalArgumentException(DEDUPLICATE_CONTENT + " must be true or false");
+  }
+
+  private static int retrievalCandidateMultiplier(Environment environment) {
+    long multiplier = number(environment, RETRIEVAL_CANDIDATE_MULTIPLIER, 4);
+    if (multiplier < 1 || multiplier > 100) {
+      throw new IllegalArgumentException(
+          RETRIEVAL_CANDIDATE_MULTIPLIER + " must be between 1 and 100");
+    }
+    return (int) multiplier;
+  }
+
+  private static long multipartPartBytes(Environment environment) {
+    long bytes = number(environment, MULTIPART_PART_BYTES, 64L * 1024 * 1024);
+    if (bytes != 0 && bytes < MIN_PART_BYTES) {
+      throw new IllegalArgumentException(MULTIPART_PART_BYTES + " must be 0 or at least 5 MiB");
+    }
+    return bytes;
+  }
+
+  private static long number(Environment environment, String name, long fallback) {
+    String value = property(environment, name);
+    if (value == null) return fallback;
+    try {
+      return Long.parseLong(value);
+    } catch (NumberFormatException exception) {
+      throw new IllegalArgumentException(name + " must be an integer", exception);
+    }
+  }
+
+  private static String property(Environment environment, String name) {
+    String value = environment.getProperty(name);
+    return value == null || value.isBlank() ? null : value.trim();
   }
 }

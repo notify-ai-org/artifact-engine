@@ -6,7 +6,6 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import dev.notify.artifact.EngineOptions;
 import dev.notify.artifact.auth.ArtifactAccessVerifier;
 import dev.notify.artifact.auth.AuthorizationService;
 import dev.notify.artifact.auth.DataVerifier;
@@ -92,7 +91,8 @@ class IngestJobTest {
         metadata,
         spool,
         new ArtifactAccessVerifier(authorization, new DataVerifier()),
-        EngineOptions.defaults());
+        true,
+        0);
   }
 
   private static AuthorizationService allowAll() {

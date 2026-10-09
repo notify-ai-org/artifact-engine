@@ -59,6 +59,20 @@ public final class WorkflowManager implements AutoCloseable, Consumer<Worker.Sta
       Duration pollInterval,
       Consumer<Throwable> failureHandler,
       WorkerManager workerManager) {
+    this(store, queues, pollInterval, failureHandler, workerManager, defaultExecutor());
+  }
+
+  /**
+   * @param scheduler runs the dispatch loop, which must not overlap itself, so it should be
+   *     single-threaded; the manager takes ownership and shuts it down on close
+   */
+  public WorkflowManager(
+      WorkflowStore store,
+      QueueManager queues,
+      Duration pollInterval,
+      Consumer<Throwable> failureHandler,
+      WorkerManager workerManager,
+      ScheduledExecutorService scheduler) {
     this.store = Objects.requireNonNull(store, "store");
     this.queues = Objects.requireNonNull(queues, "queues");
     this.pollInterval = Objects.requireNonNull(pollInterval, "pollInterval");
@@ -66,16 +80,20 @@ public final class WorkflowManager implements AutoCloseable, Consumer<Worker.Sta
     this.workerManager = workerManager;
     if (pollInterval.isZero() || pollInterval.isNegative())
       throw new IllegalArgumentException("pollInterval must be positive");
-    scheduler =
-        Executors.newSingleThreadScheduledExecutor(
-            runnable -> {
-              Thread thread = new Thread(runnable, "artifact-workflow-manager");
-              thread.setDaemon(true);
-              return thread;
-            });
+    this.scheduler = Objects.requireNonNull(scheduler, "scheduler");
     if (workerManager != null) {
       workerManager.addStateChangeListener(this);
     }
+  }
+
+  /** A single daemon thread. */
+  public static ScheduledExecutorService defaultExecutor() {
+    return Executors.newSingleThreadScheduledExecutor(
+        runnable -> {
+          Thread thread = new Thread(runnable, "artifact-workflow-manager");
+          thread.setDaemon(true);
+          return thread;
+        });
   }
 
   public Workflow create(String name, List<JobRecord> jobs) {

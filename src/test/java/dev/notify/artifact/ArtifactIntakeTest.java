@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.notify.artifact.auth.DataVerifier;
 import dev.notify.artifact.dispatcher.JobDispatcher;
 import dev.notify.artifact.embed.EmbeddingCache;
+import dev.notify.artifact.environment.StandardEnvironment;
 import dev.notify.artifact.embed.EmbeddingProvider;
 import dev.notify.artifact.embed.EmbeddingService;
 import dev.notify.artifact.factory.DefaultArtifactJobFactory;
@@ -41,7 +42,7 @@ class ArtifactIntakeTest {
             new DataVerifier(),
             embeddingService(),
             (principal, tenant, permission) -> {},
-            EngineOptions.defaults());
+            new StandardEnvironment());
     engine =
         new DefaultArtifactEngine(
             jobFactory,

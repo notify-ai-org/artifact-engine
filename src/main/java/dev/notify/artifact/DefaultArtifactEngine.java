@@ -5,11 +5,15 @@ import dev.notify.artifact.auth.DataVerifier;
 import dev.notify.artifact.dispatcher.JobDispatcher;
 import dev.notify.artifact.dispatcher.QueuingJobDispatcher;
 import dev.notify.artifact.embed.EmbeddingService;
+import dev.notify.artifact.environment.Environment;
+import dev.notify.artifact.environment.StandardEnvironment;
 import dev.notify.artifact.factory.ArtifactJobFactory;
 import dev.notify.artifact.factory.DefaultArtifactJobFactory;
 import dev.notify.artifact.job.Job;
 import dev.notify.artifact.model.Artifact;
+import dev.notify.artifact.model.JobRecord;
 import dev.notify.artifact.model.Requests;
+import dev.notify.artifact.queue.JobQueue;
 import dev.notify.artifact.queue.QueueManager;
 import dev.notify.artifact.spool.DurableSpool;
 import dev.notify.artifact.store.MetadataStore;
@@ -23,6 +27,7 @@ import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.function.Consumer;
 
 /**
@@ -33,6 +38,7 @@ public final class DefaultArtifactEngine implements ArtifactEngine {
   private final ArtifactJobFactory jobFactory;
   private final JobDispatcher dispatcher;
   private final WorkerManager workerManager;
+  private final QueueManager queueManager;
 
   public DefaultArtifactEngine(ArtifactJobFactory jobFactory, JobDispatcher dispatcher) {
     this(jobFactory, dispatcher, null);
@@ -44,9 +50,24 @@ public final class DefaultArtifactEngine implements ArtifactEngine {
    */
   public DefaultArtifactEngine(
       ArtifactJobFactory jobFactory, JobDispatcher dispatcher, WorkerManager workerManager) {
+    this(jobFactory, dispatcher, workerManager, null);
+  }
+
+  /**
+   * @param workerManager optional; backs the worker administration methods. The engine does not
+   *     own it and never closes it.
+   * @param queueManager optional; backs the queue administration methods. The engine does not own
+   *     it and never closes it.
+   */
+  public DefaultArtifactEngine(
+      ArtifactJobFactory jobFactory,
+      JobDispatcher dispatcher,
+      WorkerManager workerManager,
+      QueueManager queueManager) {
     this.jobFactory = Objects.requireNonNull(jobFactory, "jobFactory");
     this.dispatcher = Objects.requireNonNull(dispatcher, "dispatcher");
     this.workerManager = workerManager;
+    this.queueManager = queueManager;
   }
 
   public DefaultArtifactEngine(
@@ -66,7 +87,7 @@ public final class DefaultArtifactEngine implements ArtifactEngine {
         verifier,
         embeddings,
         authorization,
-        queueManager, EngineOptions.defaults());
+        queueManager, new StandardEnvironment());
   }
 
   public DefaultArtifactEngine(
@@ -78,7 +99,7 @@ public final class DefaultArtifactEngine implements ArtifactEngine {
       EmbeddingService embeddings,
       AuthorizationService authorization,
       QueueManager queueManager,
-      EngineOptions options) {
+      Environment environment) {
     this(
         new DefaultArtifactJobFactory(
             metadata,
@@ -88,8 +109,10 @@ public final class DefaultArtifactEngine implements ArtifactEngine {
             verifier,
             embeddings,
             authorization,
-            options),
-        new QueuingJobDispatcher(queueManager));
+            environment),
+        new QueuingJobDispatcher(queueManager),
+        null,
+        queueManager);
   }
 
   @Override
@@ -194,6 +217,24 @@ public final class DefaultArtifactEngine implements ArtifactEngine {
   @Override
   public void removeJobStateListener(Consumer<Worker.StateChange> listener) {
     workers("remove a job state listener").removeStateChangeListener(listener);
+  }
+
+  @Override
+  public void addQueue(JobRecord.JobType type, JobQueue queue) {
+    queues("add a queue").addQueue(type, queue);
+  }
+
+  @Override
+  public Optional<JobQueue> removeQueue(JobRecord.JobType type) {
+    return queues("remove a queue").removeQueue(type);
+  }
+
+  private QueueManager queues(String operation) {
+    if (queueManager == null) {
+      throw new UnsupportedOperationException(
+          "Cannot " + operation + ": this engine has no queue manager");
+    }
+    return queueManager;
   }
 
   private WorkerManager workers(String operation) {

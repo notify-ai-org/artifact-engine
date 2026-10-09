@@ -5,6 +5,7 @@ import java.time.Duration;
 import java.util.Objects;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
@@ -12,23 +13,36 @@ import java.util.concurrent.TimeUnit;
 
 /** Bounded worker dedicated to process-local request/response jobs. */
 public final class DirectJobWorker implements AutoCloseable {
-  private final ThreadPoolExecutor executor;
+  private final ExecutorService executor;
 
   public DirectJobWorker(int threads, int capacity) {
+    this(defaultExecutor(threads, capacity));
+  }
+
+  /**
+   * @param executor runs the jobs. It must reject work it cannot take (rather than block or run it
+   *     on the caller), which is what bounds this worker. The worker takes ownership and shuts it
+   *     down on close.
+   */
+  public DirectJobWorker(ExecutorService executor) {
+    this.executor = Objects.requireNonNull(executor, "executor");
+  }
+
+  /** A fixed pool of daemon threads with a bounded queue that rejects when full. */
+  public static ExecutorService defaultExecutor(int threads, int capacity) {
     if (threads < 1 || capacity < 1) throw new IllegalArgumentException("threads and capacity must be positive");
-    executor =
-        new ThreadPoolExecutor(
-            threads,
-            threads,
-            0,
-            TimeUnit.MILLISECONDS,
-            new ArrayBlockingQueue<>(capacity),
-            runnable -> {
-              Thread thread = new Thread(runnable, "artifact-direct-worker");
-              thread.setDaemon(true);
-              return thread;
-            },
-            new ThreadPoolExecutor.AbortPolicy());
+    return new ThreadPoolExecutor(
+        threads,
+        threads,
+        0,
+        TimeUnit.MILLISECONDS,
+        new ArrayBlockingQueue<>(capacity),
+        runnable -> {
+          Thread thread = new Thread(runnable, "artifact-direct-worker");
+          thread.setDaemon(true);
+          return thread;
+        },
+        new ThreadPoolExecutor.AbortPolicy());
   }
 
   public <R> R execute(DirectJob<R> job) throws Exception {

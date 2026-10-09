@@ -1,4 +1,4 @@
-package dev.notify.artifact.mcp.stdio;
+package dev.notify.artifact;
 
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -8,10 +8,14 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import dev.notify.artifact.ArtifactEngine;
+import dev.notify.artifact.DefaultArtifactMcpEngineProvider;
 import dev.notify.artifact.auth.AuthorizationService.Permission;
 import dev.notify.artifact.environment.MapEnvironmentSource;
 import dev.notify.artifact.environment.StandardEnvironment;
+import dev.notify.artifact.mcp.stdio.ArtifactMcpEngineProvider;
 import dev.notify.artifact.model.JobRecord;
+import dev.notify.artifact.queue.InMemoryJobQueue;
+import dev.notify.artifact.queue.JobQueue;
 import dev.notify.artifact.worker.WorkerManager;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -115,6 +119,25 @@ class DefaultArtifactMcpEngineProviderTest {
 
       assertTrue(engine.workers().isEmpty());
       assertEquals(Map.of(), engine.jobStates());
+    } finally {
+      provider.close();
+    }
+  }
+
+  @Test
+  void exposesQueueRegistrationThroughTheFacade() {
+    var provider = new DefaultArtifactMcpEngineProvider();
+    try {
+      ArtifactEngine engine =
+          provider.createEngine(environment(Map.of("ARTIFACT_BACKGROUND_WORKERS_ENABLED", "false")));
+      JobQueue queue = new InMemoryJobQueue();
+
+      engine.addQueue(JobRecord.JobType.INDEX, queue);
+      assertThrows(
+          IllegalStateException.class,
+          () -> engine.addQueue(JobRecord.JobType.INDEX, new InMemoryJobQueue()));
+      assertEquals(queue, engine.removeQueue(JobRecord.JobType.INDEX).orElseThrow());
+      assertTrue(engine.removeQueue(JobRecord.JobType.INDEX).isEmpty());
     } finally {
       provider.close();
     }

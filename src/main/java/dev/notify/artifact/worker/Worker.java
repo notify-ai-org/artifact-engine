@@ -98,6 +98,33 @@ public final class Worker implements AutoCloseable {
       Consumer<JobFailure> failureHandler,
       JobRecordExecutor jobExecutor,
       JobStore jobStore) {
+    this(
+        id, batchSize, batchBytes, type, queueManager, retryPolicy, leaseDuration,
+        idlePollInterval, flushInterval, failureHandler, jobExecutor, jobStore,
+        ExecutorFactory.defaults().jobExecution(id), ExecutorFactory.defaults().batchWaiter(id));
+  }
+
+  /**
+   * @param jobExecutorService runs the jobs of a batch in parallel
+   * @param batchWaiter waits for each batch to finish; batches must not overlap, so it should be
+   *     single-threaded
+   *     <p>The worker takes ownership of both and shuts them down on close.
+   */
+  public Worker(
+      String id,
+      int batchSize,
+      long batchBytes,
+      JobRecord.JobType type,
+      QueueManager queueManager,
+      RetryPolicy retryPolicy,
+      Duration leaseDuration,
+      Duration idlePollInterval,
+      Duration flushInterval,
+      Consumer<JobFailure> failureHandler,
+      JobRecordExecutor jobExecutor,
+      JobStore jobStore,
+      ExecutorService jobExecutorService,
+      ExecutorService batchWaiter) {
     this.id = id;
     this.buffer = new Buffer<>(batchSize, batchBytes, flushInterval);
     this.type = type;
@@ -111,12 +138,37 @@ public final class Worker implements AutoCloseable {
     if (leaseDuration.isZero() || leaseDuration.isNegative()) {
       throw new IllegalArgumentException("leaseDuration must be positive");
     }
-    this.jobExecutorService =
-        Executors.newCachedThreadPool(
-            runnable -> daemonThread(runnable, "artifact-job-execution-" + id));
-    this.batchWaiter =
-        Executors.newSingleThreadExecutor(
-            runnable -> daemonThread(runnable, "artifact-batch-waiter-" + id));
+    this.jobExecutorService = Objects.requireNonNull(jobExecutorService, "jobExecutorService");
+    this.batchWaiter = Objects.requireNonNull(batchWaiter, "batchWaiter");
+  }
+
+  /**
+   * Supplies the executors of each worker a {@link WorkerManager} creates. Every call must return
+   * a new executor: a worker shuts its executors down when it closes.
+   */
+  public interface ExecutorFactory {
+    /** Runs the jobs of a batch in parallel. */
+    ExecutorService jobExecution(String workerId);
+
+    /** Waits for each batch to finish; should be single-threaded. */
+    ExecutorService batchWaiter(String workerId);
+
+    /** An unbounded cached pool for jobs and a single waiter thread, all daemon threads. */
+    static ExecutorFactory defaults() {
+      return new ExecutorFactory() {
+        @Override
+        public ExecutorService jobExecution(String workerId) {
+          return Executors.newCachedThreadPool(
+              runnable -> daemonThread(runnable, "artifact-job-execution-" + workerId));
+        }
+
+        @Override
+        public ExecutorService batchWaiter(String workerId) {
+          return Executors.newSingleThreadExecutor(
+              runnable -> daemonThread(runnable, "artifact-batch-waiter-" + workerId));
+        }
+      };
+    }
   }
 
   public synchronized void start() {

@@ -65,6 +65,25 @@ public final class WorkflowRetryScheduler implements AutoCloseable {
       Clock clock,
       int batchSize,
       Consumer<Throwable> failureHandler) {
+    this(store, manager, policy, schedule, deadLetters, deadLetterHandler, clock, batchSize,
+        failureHandler, defaultExecutor());
+  }
+
+  /**
+   * @param executor fires each scheduled run; the scheduler takes ownership and shuts it down on
+   *     close
+   */
+  public WorkflowRetryScheduler(
+      WorkflowStore store,
+      WorkflowManager manager,
+      RetryPolicy policy,
+      TriggerSchedule schedule,
+      DeadLetterQueue deadLetters,
+      DeadLetterHandler deadLetterHandler,
+      Clock clock,
+      int batchSize,
+      Consumer<Throwable> failureHandler,
+      ScheduledExecutorService executor) {
     this.store = Objects.requireNonNull(store, "store");
     this.manager = manager;
     this.policy = Objects.requireNonNull(policy, "policy");
@@ -75,13 +94,17 @@ public final class WorkflowRetryScheduler implements AutoCloseable {
     this.failureHandler = Objects.requireNonNull(failureHandler, "failureHandler");
     if (batchSize < 1) throw new IllegalArgumentException("batchSize must be positive");
     this.batchSize = batchSize;
-    this.executor =
-        Executors.newSingleThreadScheduledExecutor(
-            runnable -> {
-              Thread thread = new Thread(runnable, "artifact-workflow-retry");
-              thread.setDaemon(true);
-              return thread;
-            });
+    this.executor = Objects.requireNonNull(executor, "executor");
+  }
+
+  /** A single daemon thread. */
+  public static ScheduledExecutorService defaultExecutor() {
+    return Executors.newSingleThreadScheduledExecutor(
+        runnable -> {
+          Thread thread = new Thread(runnable, "artifact-workflow-retry");
+          thread.setDaemon(true);
+          return thread;
+        });
   }
 
   public void start() {

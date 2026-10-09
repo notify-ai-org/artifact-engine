@@ -7,7 +7,6 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import dev.notify.artifact.EngineOptions;
 import dev.notify.artifact.auth.ArtifactAccessVerifier;
 import dev.notify.artifact.auth.DataVerifier;
 import dev.notify.artifact.model.Artifact;
@@ -206,7 +205,8 @@ class MultipartStoreJobsTest {
             metadata,
             spool,
             new ArtifactAccessVerifier((principal, tenant, permission) -> {}, new DataVerifier()),
-            new EngineOptions(false, 4, PART))
+            false,
+            PART)
         .execute();
   }
 

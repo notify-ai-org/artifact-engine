@@ -64,13 +64,14 @@ class EngineDispatchTest {
 
   @Test
   void engineHoldsOnlyFactoryAndDispatcherAndJobsNeverReferenceEngine() {
-    // Tenant operations go only through the factory and dispatcher. The worker manager backs the
-    // operator-only worker administration methods and is never used by a tenant operation.
+    // Tenant operations go only through the factory and dispatcher. The worker and queue managers
+    // back the operator-only administration methods and are never used by a tenant operation.
     assertEquals(
         java.util.Set.of(
             ArtifactJobFactory.class,
             JobDispatcher.class,
-            dev.notify.artifact.worker.WorkerManager.class),
+            dev.notify.artifact.worker.WorkerManager.class,
+            dev.notify.artifact.queue.QueueManager.class),
         java.util.Arrays.stream(DefaultArtifactEngine.class.getDeclaredFields())
             .map(java.lang.reflect.Field::getType)
             .collect(java.util.stream.Collectors.toSet()));

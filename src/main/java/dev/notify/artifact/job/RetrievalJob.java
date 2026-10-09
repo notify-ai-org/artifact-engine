@@ -1,6 +1,5 @@
 package dev.notify.artifact.job;
 
-import dev.notify.artifact.EngineOptions;
 import dev.notify.artifact.auth.ArtifactAccessVerifier;
 import dev.notify.artifact.auth.AuthorizationService;
 import dev.notify.artifact.cache.RetrievalResultCache;
@@ -27,7 +26,7 @@ public final class RetrievalJob extends AbstractJob<List<Requests.SearchHit>>
   private final VectorStore vectorStore;
   private final EmbeddingService embeddingService;
   private final ArtifactAccessVerifier accessVerifier;
-  private final EngineOptions options;
+  private final int retrievalCandidateMultiplier;
   private final RetrievalResultCache resultCache;
 
   public RetrievalJob(
@@ -36,8 +35,9 @@ public final class RetrievalJob extends AbstractJob<List<Requests.SearchHit>>
       VectorStore vectorStore,
       EmbeddingService embeddingService,
       ArtifactAccessVerifier accessVerifier,
-      EngineOptions options) {
-    this(request, metadataStore, vectorStore, embeddingService, accessVerifier, options, null);
+      int retrievalCandidateMultiplier) {
+    this(request, metadataStore, vectorStore, embeddingService, accessVerifier,
+        retrievalCandidateMultiplier, null);
   }
 
   /** @param resultCache optional; consulted only after the caller is authorized to search */
@@ -47,7 +47,7 @@ public final class RetrievalJob extends AbstractJob<List<Requests.SearchHit>>
       VectorStore vectorStore,
       EmbeddingService embeddingService,
       ArtifactAccessVerifier accessVerifier,
-      EngineOptions options,
+      int retrievalCandidateMultiplier,
       RetrievalResultCache resultCache) {
     super(accessVerifier, metadataStore);
     this.resultCache = resultCache;
@@ -55,7 +55,7 @@ public final class RetrievalJob extends AbstractJob<List<Requests.SearchHit>>
     this.vectorStore = vectorStore;
     this.embeddingService = embeddingService;
     this.accessVerifier = accessVerifier;
-    this.options = options;
+    this.retrievalCandidateMultiplier = retrievalCandidateMultiplier;
   }
 
   @Override
@@ -66,7 +66,7 @@ public final class RetrievalJob extends AbstractJob<List<Requests.SearchHit>>
 
   private List<Requests.SearchHit> search() {
     float[] queryEmbedding = embeddingService.embedQuery(request.query());
-    int candidateLimit = request.limit() * options.retrievalCandidateMultiplier();
+    int candidateLimit = request.limit() * retrievalCandidateMultiplier;
     VectorStore.SearchFilter storeFilter =
         new VectorStore.SearchFilter(request.mediaTypes(), request.tags());
     List<VectorStore.ScoredChunk> semantic =

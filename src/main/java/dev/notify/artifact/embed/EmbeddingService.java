@@ -59,6 +59,25 @@ public final class EmbeddingService implements AutoCloseable {
       Duration cacheTtl,
       RetryPolicy retryPolicy,
       QueryEmbeddingCache queryCache) {
+    this(providers, cache, maxBatchSize, maxWait, cacheTtl, retryPolicy, queryCache,
+        defaultExecutor(providers == null ? 0 : providers.size()));
+  }
+
+  /**
+   * @param queryCache backs {@link #embedQuery}; null sends queries through the general cache
+   * @param executor flushes the per-model batches, so it should have a thread per model; the
+   *     service takes ownership and shuts it down on close
+   */
+  public EmbeddingService(
+      List<EmbeddingProvider> providers,
+      EmbeddingCache cache,
+      int maxBatchSize,
+      Duration maxWait,
+      Duration cacheTtl,
+      RetryPolicy retryPolicy,
+      QueryEmbeddingCache queryCache,
+      ScheduledExecutorService executor) {
+    this.executor = Objects.requireNonNull(executor, "executor");
     this.queryCache = queryCache;
     if (providers == null || providers.isEmpty()) {
       throw new IllegalArgumentException("at least one embedding model is required");
@@ -73,13 +92,6 @@ public final class EmbeddingService implements AutoCloseable {
     this.cache = Objects.requireNonNull(cache, "cache");
     this.cacheTtl = cacheTtl;
     RetryPolicy policy = Objects.requireNonNull(retryPolicy, "retryPolicy");
-    ThreadFactory threads =
-        task -> {
-          Thread thread = new Thread(task, "artifact-embedding-batcher");
-          thread.setDaemon(true);
-          return thread;
-        };
-    this.executor = Executors.newScheduledThreadPool(providers.size(), threads);
     Map<String, ModelBatcher> configured = new LinkedHashMap<>();
     for (EmbeddingProvider provider : providers) {
       Objects.requireNonNull(provider, "embedding provider");
@@ -94,6 +106,17 @@ public final class EmbeddingService implements AutoCloseable {
     }
     this.batchers = Collections.unmodifiableMap(new LinkedHashMap<>(configured));
     this.defaultModel = providers.get(0).model();
+  }
+
+  /** Daemon threads, one per embedding model (at least one). */
+  public static ScheduledExecutorService defaultExecutor(int models) {
+    ThreadFactory threads =
+        task -> {
+          Thread thread = new Thread(task, "artifact-embedding-batcher");
+          thread.setDaemon(true);
+          return thread;
+        };
+    return Executors.newScheduledThreadPool(Math.max(1, models), threads);
   }
 
   public List<float[]> embed(List<String> texts) {

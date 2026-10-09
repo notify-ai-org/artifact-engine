@@ -27,8 +27,10 @@ The `ArtifactEngine` facade provides:
 
 Every request carries a trusted principal ID and tenant ID. Applications normally construct a
 `DefaultArtifactJobFactory`, select direct and queued dispatchers, and pass both to
-`DefaultArtifactEngine`. `EngineOptions` controls content deduplication and the retrieval candidate
-multiplier.
+`DefaultArtifactEngine`. The factory reads content deduplication
+(`ARTIFACT_DEDUPLICATE_CONTENT`), the retrieval candidate multiplier
+(`ARTIFACT_RETRIEVAL_CANDIDATE_MULTIPLIER`), and the multipart part size
+(`ARTIFACT_STORE_MULTIPART_PART_BYTES`) from the `Environment` it is given.
 
 ## Processing guarantees
 

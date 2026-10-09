@@ -35,6 +35,7 @@ public final class WorkerManager implements AutoCloseable {
   private final JobStore jobStore;
   private final Duration leaseDuration;
   private final Duration pollInterval;
+  private final Worker.ExecutorFactory workerExecutors;
   private final List<Consumer<Worker.StateChange>> stateChangeListeners =
       new CopyOnWriteArrayList<>();
   private final Map<String, Worker.StateChange> latestStateChanges = new ConcurrentHashMap<>();
@@ -108,6 +109,32 @@ public final class WorkerManager implements AutoCloseable {
       JobStore jobStore,
       Duration leaseDuration,
       Duration pollInterval) {
+    this(
+        failureHandler,
+        snapshotStore,
+        initialWorkers,
+        maxWorkers,
+        queueManager,
+        jobExecutor,
+        jobStore,
+        leaseDuration,
+        pollInterval,
+        Worker.ExecutorFactory.defaults());
+  }
+
+  /** @param workerExecutors supplies the executors of every worker this manager creates */
+  public WorkerManager(
+      java.util.function.Consumer<Worker.JobFailure> failureHandler,
+      WorkerSnapshotStore snapshotStore,
+      List<WorkerConfiguration> initialWorkers,
+      int maxWorkers,
+      QueueManager queueManager,
+      JobRecordExecutor jobExecutor,
+      JobStore jobStore,
+      Duration leaseDuration,
+      Duration pollInterval,
+      Worker.ExecutorFactory workerExecutors) {
+    this.workerExecutors = Objects.requireNonNull(workerExecutors, "workerExecutors");
     this.failureHandler = Objects.requireNonNull(failureHandler, "failureHandler");
     this.snapshotStore = snapshotStore;
     this.queueManager = Objects.requireNonNull(queueManager, "queueManager");
@@ -244,7 +271,9 @@ public final class WorkerManager implements AutoCloseable {
             flushInterval,
             failureHandler,
             jobExecutor,
-            jobStore);
+            jobStore,
+            workerExecutors.jobExecution(id),
+            workerExecutors.batchWaiter(id));
     Managed managed = new Managed(worker, settings, Objects.requireNonNull(lastUsed, "lastUsed"));
     workers.put(id, managed);
     worker.onStateChange(this::handleStateChange);

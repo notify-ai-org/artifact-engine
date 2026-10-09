@@ -9,7 +9,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sun.net.httpserver.HttpServer;
 import dev.notify.artifact.DefaultArtifactEngine;
-import dev.notify.artifact.EngineOptions;
+import dev.notify.artifact.environment.StandardEnvironment;
 import dev.notify.artifact.auth.DataVerifier;
 import dev.notify.artifact.chunk.ChunkBufferPool;
 import dev.notify.artifact.chunk.ChunkedIngestSupport;
@@ -139,7 +139,7 @@ class ChunkedSourceIngestTest {
     directWorker = new DirectJobWorker(2, 16);
     DefaultArtifactJobFactory factory = new DefaultArtifactJobFactory(
         metadata, vectors, objects, spool, new DataVerifier(), embeddings,
-        (principal, tenant, permission) -> {}, EngineOptions.defaults(), workflowManager, support);
+        (principal, tenant, permission) -> {}, new StandardEnvironment(), workflowManager, support);
     engine = new DefaultArtifactEngine(factory,
         new RoutingJobDispatcher(new DirectJobDispatcher(directWorker),
             new QueuingJobDispatcher(queues)), workers);

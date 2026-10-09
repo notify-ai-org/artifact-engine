@@ -1,7 +1,10 @@
 package dev.notify.artifact;
 
 import dev.notify.artifact.model.Artifact;
+import dev.notify.artifact.model.JobRecord;
 import dev.notify.artifact.model.Requests;
+import dev.notify.artifact.queue.JobQueue;
+import dev.notify.artifact.queue.QueueManager;
 import dev.notify.artifact.worker.Worker;
 import dev.notify.artifact.worker.WorkerManager;
 import java.io.IOException;
@@ -9,6 +12,7 @@ import java.io.InputStream;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.function.Consumer;
 
 /**
@@ -17,7 +21,8 @@ import java.util.function.Consumer;
  * <p>The worker administration methods at the end are process-level operator controls over the
  * background workers that store and index artifacts. They are not tenant-scoped and not
  * authorized per principal; hosts must not expose them to tenant callers. Engines built without a
- * {@link WorkerManager} throw {@link UnsupportedOperationException}.
+ * {@link WorkerManager} throw {@link UnsupportedOperationException}. The queue administration
+ * methods are operator-level in the same way and need a {@link QueueManager}.
  */
 public interface ArtifactEngine {
   Artifact ingest(Requests.Ingest request) throws IOException;
@@ -92,6 +97,30 @@ public interface ArtifactEngine {
 
   default void removeJobStateListener(Consumer<Worker.StateChange> listener) {
     throw workersNotConfigured();
+  }
+
+  // ---- Queue administration (operator-level, not tenant-scoped) -----------------------------
+
+  /**
+   * Registers the queue that holds jobs of one type, for example to back it with a different
+   * store than the default.
+   *
+   * @throws IllegalStateException if the job type already has a queue
+   */
+  default void addQueue(JobRecord.JobType type, JobQueue queue) {
+    throw queuesNotConfigured();
+  }
+
+  /**
+   * Unregisters the queue of one job type and returns it, with whatever jobs it still holds. The
+   * next job of that type gets a fresh default queue.
+   */
+  default Optional<JobQueue> removeQueue(JobRecord.JobType type) {
+    throw queuesNotConfigured();
+  }
+
+  private static UnsupportedOperationException queuesNotConfigured() {
+    return new UnsupportedOperationException("This engine has no queue manager");
   }
 
   private static UnsupportedOperationException workersNotConfigured() {

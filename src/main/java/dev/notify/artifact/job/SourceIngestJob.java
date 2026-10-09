@@ -1,6 +1,5 @@
 package dev.notify.artifact.job;
 
-import dev.notify.artifact.EngineOptions;
 import dev.notify.artifact.auth.ArtifactAccessVerifier;
 import dev.notify.artifact.auth.AuthorizationService;
 import dev.notify.artifact.auth.DataVerifier;

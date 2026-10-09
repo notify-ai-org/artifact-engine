@@ -43,19 +43,35 @@ public final class QueueManager implements AutoCloseable {
       Function<JobRecord.JobType, JobQueue> queueFactory,
       Duration interval,
       Consumer<Throwable> failureHandler) {
+    this(queueFactory, interval, failureHandler, defaultExecutor());
+  }
+
+  /**
+   * @param maintenance runs the periodic lease recovery; the manager takes ownership and shuts it
+   *     down on close
+   */
+  public QueueManager(
+      Function<JobRecord.JobType, JobQueue> queueFactory,
+      Duration interval,
+      Consumer<Throwable> failureHandler,
+      ScheduledExecutorService maintenance) {
     this.queueFactory = Objects.requireNonNull(queueFactory, "queueFactory");
     this.interval = Objects.requireNonNull(interval, "interval");
     if (interval.isZero() || interval.isNegative()) {
       throw new IllegalArgumentException("interval must be positive");
     }
     this.failureHandler = Objects.requireNonNull(failureHandler, "failureHandler");
-    this.maintenance =
-        Executors.newSingleThreadScheduledExecutor(
-            runnable -> {
-              Thread thread = new Thread(runnable, "artifact-queue-maintenance");
-              thread.setDaemon(true);
-              return thread;
-            });
+    this.maintenance = Objects.requireNonNull(maintenance, "maintenance");
+  }
+
+  /** A single daemon thread, which is all the maintenance pass needs. */
+  public static ScheduledExecutorService defaultExecutor() {
+    return Executors.newSingleThreadScheduledExecutor(
+        runnable -> {
+          Thread thread = new Thread(runnable, "artifact-queue-maintenance");
+          thread.setDaemon(true);
+          return thread;
+        });
   }
 
   public synchronized void start() {
