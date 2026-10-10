@@ -1,7 +1,8 @@
 package dev.notify.artifact.mcp.stdio;
 
 import dev.notify.artifact.ArtifactEngine;
-import dev.notify.artifact.DefaultArtifactMcpEngineProvider;
+import dev.notify.artifact.ArtifactEngineProvider;
+import dev.notify.artifact.DefaultArtifactEngineProvider;
 import dev.notify.artifact.environment.CommandLineEnvironmentSource;
 import dev.notify.artifact.environment.Environment;
 import dev.notify.artifact.environment.PropertiesFileEnvironmentSource;
@@ -40,7 +41,7 @@ public final class ArtifactMcpStdioMain {
     System.setOut(System.err);
 
     Environment environment = environment(args);
-    ArtifactMcpEngineProvider provider = new DefaultArtifactMcpEngineProvider();
+    ArtifactEngineProvider provider = new DefaultArtifactEngineProvider();
     ArtifactEngine engine = provider.createEngine(environment);
     McpArtifactGateway gateway =
         new McpArtifactGateway(

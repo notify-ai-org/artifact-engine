@@ -7,12 +7,9 @@ import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-import dev.notify.artifact.ArtifactEngine;
-import dev.notify.artifact.DefaultArtifactMcpEngineProvider;
 import dev.notify.artifact.auth.AuthorizationService.Permission;
 import dev.notify.artifact.environment.MapEnvironmentSource;
 import dev.notify.artifact.environment.StandardEnvironment;
-import dev.notify.artifact.mcp.stdio.ArtifactMcpEngineProvider;
 import dev.notify.artifact.model.JobRecord;
 import dev.notify.artifact.queue.InMemoryJobQueue;
 import dev.notify.artifact.queue.JobQueue;
@@ -38,7 +35,7 @@ class DefaultArtifactMcpEngineProviderTest {
                     "ARTIFACT_MCP_SCOPES",
                         "artifact.search,artifact.metadata,artifact.text,artifact.content")));
 
-    var authorization = DefaultArtifactMcpEngineProvider.authorizationService(environment);
+    var authorization = DefaultArtifactEngineProvider.authorizationService(environment);
 
     assertDoesNotThrow(() -> authorization.require("principal-a", "tenant-a", Permission.SEARCH));
     assertDoesNotThrow(
@@ -52,11 +49,11 @@ class DefaultArtifactMcpEngineProviderTest {
 
   @Test
   void registersExactlyOneDefaultProvider() {
-    var providers = ServiceLoader.load(ArtifactMcpEngineProvider.class).stream().toList();
+    var providers = ServiceLoader.load(ArtifactEngineProvider.class).stream().toList();
 
     assertEquals(1, providers.size());
     var provider = providers.get(0).get();
-    assertInstanceOf(DefaultArtifactMcpEngineProvider.class, provider);
+    assertInstanceOf(DefaultArtifactEngineProvider.class, provider);
     var environment =
         new StandardEnvironment(
             new MapEnvironmentSource(
@@ -80,7 +77,7 @@ class DefaultArtifactMcpEngineProviderTest {
 
   @Test
   void startsOneWorkerPerDurableJobTypeAndExposesThemThroughTheFacade() {
-    var provider = new DefaultArtifactMcpEngineProvider();
+    var provider = new DefaultArtifactEngineProvider();
     try {
       ArtifactEngine engine = provider.createEngine(environment(Map.of()));
 
@@ -112,7 +109,7 @@ class DefaultArtifactMcpEngineProviderTest {
 
   @Test
   void backgroundWorkersCanBeDisabledForAReadOnlyReplica() {
-    var provider = new DefaultArtifactMcpEngineProvider();
+    var provider = new DefaultArtifactEngineProvider();
     try {
       ArtifactEngine engine =
           provider.createEngine(environment(Map.of("ARTIFACT_BACKGROUND_WORKERS_ENABLED", "false")));
@@ -126,7 +123,7 @@ class DefaultArtifactMcpEngineProviderTest {
 
   @Test
   void exposesQueueRegistrationThroughTheFacade() {
-    var provider = new DefaultArtifactMcpEngineProvider();
+    var provider = new DefaultArtifactEngineProvider();
     try {
       ArtifactEngine engine =
           provider.createEngine(environment(Map.of("ARTIFACT_BACKGROUND_WORKERS_ENABLED", "false")));

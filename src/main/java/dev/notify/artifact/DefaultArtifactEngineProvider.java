@@ -28,10 +28,10 @@ import dev.notify.artifact.cache.RetrievalResultCache;
 import dev.notify.artifact.extract.TextExtractorFactory;
 import dev.notify.artifact.store.InvalidatingMetadataStore;
 import dev.notify.artifact.job.IndexJob;
-import dev.notify.artifact.mcp.stdio.ArtifactMcpEngineProvider;
 import dev.notify.artifact.mcp.stdio.ArtifactMcpStdioMain;
 import dev.notify.artifact.model.JobRecord;
 import dev.notify.artifact.multipart.MultipartUploadCleaner;
+import dev.notify.artifact.ocr.Ocr;
 import dev.notify.artifact.queue.InMemoryJobQueue;
 import dev.notify.artifact.queue.QueueManager;
 import dev.notify.artifact.spool.DurableSpool;
@@ -56,6 +56,7 @@ import dev.notify.artifact.worker.DefaultJobRecordExecutor;
 import dev.notify.artifact.worker.JobRecordExecutor;
 import dev.notify.artifact.worker.Worker;
 import dev.notify.artifact.worker.WorkerManager;
+import dev.notify.artifact.worker.WorkerSnapshotStore;
 import dev.notify.artifact.workflow.InMemoryWorkflowStore;
 import dev.notify.artifact.workflow.TriggerSchedule;
 import dev.notify.artifact.workflow.WorkflowManager;
@@ -88,13 +89,13 @@ import org.jdbi.v3.core.Jdbi;
  * <p>When a JDBC URL is configured, metadata and vectors use PostgreSQL through Jdbi. Without one,
  * the provider falls back to process-local development stores.
  */
-public final class DefaultArtifactMcpEngineProvider implements ArtifactMcpEngineProvider {
+public final class DefaultArtifactEngineProvider implements ArtifactEngineProvider {
   // System.Logger writes to stderr, which keeps stdout free for the MCP stdio protocol.
   public static final String TENANT_ENV = "ARTIFACT_MCP_TENANT_ID";
   public static final String PRINCIPAL_ENV = "ARTIFACT_MCP_PRINCIPAL_ID";
   public static final String SCOPES_ENV = "ARTIFACT_MCP_SCOPES";
   private static final System.Logger LOGGER =
-      System.getLogger(DefaultArtifactMcpEngineProvider.class.getName());
+      System.getLogger(DefaultArtifactEngineProvider.class.getName());
 
   private ArtifactEngine engine;
   private HikariDataSource dataSource;
@@ -107,14 +108,18 @@ public final class DefaultArtifactMcpEngineProvider implements ArtifactMcpEngine
   private WorkflowManager workflowManager;
   private WorkflowRetryScheduler retryScheduler;
 
-  @Override
+  @Override 
   public synchronized ArtifactEngine createEngine(Environment environment) {
+    return createEngine(environment, new ArtifactEngineBuilder());
+  }
+
+  @Override
+  public synchronized ArtifactEngine createEngine(Environment environment,ArtifactEngineBuilder builder) {
     if (engine != null) return engine;
     ObjectMapper objectMapper = new ObjectMapper().findAndRegisterModules();
     String jdbcUrl =
         firstNonBlank(property(environment, "ARTIFACT_JDBC_URL"), property(environment, "JDBC_DATABASE_URL"));
     int vectorDimensions = positiveInt(environment, "ARTIFACT_VECTOR_DIMENSIONS", 1536);
-    ArtifactEngineBuilder builder = new ArtifactEngineBuilder();
     // Without a JDBC URL the builder's process-local stores are used.
     if (jdbcUrl != null) {
       dataSource = dataSource(environment, jdbcUrl);
@@ -220,229 +225,15 @@ public final class DefaultArtifactMcpEngineProvider implements ArtifactMcpEngine
                     2.0,
                     0.2,
                     failure -> true))
+            .deadLetterHandler(
+                defaultDeadLetterHandler(
+                    builder.multipartUploads, builder.objects))
             .retryBatchSize(positiveInt(environment, "ARTIFACT_WORKFLOW_RETRY_BATCH_SIZE", 100))
             .build();
     return engine;
   }
 
-  /**
-   * Collects the dependencies of the engine; {@link #build()} wires them into one.
-   *
-   * <p>Only the object store, spool, embeddings, and authorization must be supplied: they have no
-   * meaningful default. Everything else starts with a default and a setter replaces it. The
-   * stores default to process-local ones that lose their contents on restart.
-   */
-  private final class ArtifactEngineBuilder {
-    private ObjectStore objects;
-    private DurableSpool spool;
-    private EmbeddingService embeddings;
-    private AuthorizationService authorization;
-    private MetadataStore metadata = new InMemoryStores.Metadata();
-    private VectorStore vectors = new InMemoryStores.Vectors();
-    private JobStore jobStore = new InMemoryJobStore();
-    private WorkflowStore workflowStore = new InMemoryWorkflowStore();
-    private MultipartUploadStore multipartUploads = new InMemoryMultipartUploadStore();
-    private RetrievalResultCache retrievalCache =
-        new RetrievalResultCache(64L * 1024 * 1024, Duration.ofSeconds(300));
-    private TextExtractorFactory extractors =
-        TextExtractorFactory.defaults(128 * 1024 * 1024, Integer.MAX_VALUE);
-    private Chunker chunker = new Chunker(300, 30);
-    private IndexJob.Options indexOptions =
-        new IndexJob.Options(64, 10_000, IndexJob.ChunkLimitPolicy.FAIL);
-    private StorageKeyFactory storageKeys = new StorageKeyFactory("default", Clock.systemUTC());
-    private Environment environment = new StandardEnvironment();
-    private boolean backgroundWorkers = true;
-    private List<WorkerManager.WorkerConfiguration> initialWorkers = List.of();
-    private int maxWorkers = WorkerManager.DEFAULT_MAX_WORKERS;
-    private Duration workerLease = WorkerManager.DEFAULT_LEASE_DURATION;
-    private Duration workflowPollInterval = Duration.ofSeconds(1);
-    private boolean workflowRetries = true;
-    private TriggerSchedule retrySchedule = TriggerSchedule.every(Duration.ofMinutes(5));
-    private RetryPolicy retryPolicy =
-        new RetryPolicy(5, Duration.ofMinutes(1), Duration.ofHours(6), 2.0, 0.2, failure -> true);
-    private int retryBatchSize = 100;
-    private DeadLetterQueue deadLetters = new InMemoryDeadLetterQueue();
-    // Left null until build(): the default handler and executors depend on other settings or hold
-    // threads, so they are created only if none was supplied.
-    private DeadLetterHandler deadLetterHandler;
-    private ScheduledExecutorService queueMaintenanceExecutor;
-    private Worker.ExecutorFactory workerExecutors;
-    private ScheduledExecutorService workflowExecutor;
-    private ScheduledExecutorService retryExecutor;
-    private ExecutorService directJobExecutor;
-
-    ArtifactEngineBuilder metadata(MetadataStore metadata) {
-      this.metadata = metadata;
-      return this;
-    }
-
-    ArtifactEngineBuilder vectors(VectorStore vectors) {
-      this.vectors = vectors;
-      return this;
-    }
-
-    ArtifactEngineBuilder jobStore(JobStore jobStore) {
-      this.jobStore = jobStore;
-      return this;
-    }
-
-    ArtifactEngineBuilder workflowStore(WorkflowStore workflowStore) {
-      this.workflowStore = workflowStore;
-      return this;
-    }
-
-    ArtifactEngineBuilder multipartUploads(MultipartUploadStore multipartUploads) {
-      this.multipartUploads = multipartUploads;
-      return this;
-    }
-
-    ArtifactEngineBuilder objects(ObjectStore objects) {
-      this.objects = objects;
-      return this;
-    }
-
-    ArtifactEngineBuilder spool(DurableSpool spool) {
-      this.spool = spool;
-      return this;
-    }
-
-    ArtifactEngineBuilder embeddings(EmbeddingService embeddings) {
-      this.embeddings = embeddings;
-      return this;
-    }
-
-    ArtifactEngineBuilder authorization(AuthorizationService authorization) {
-      this.authorization = authorization;
-      return this;
-    }
-
-    /** Null disables search result caching. */
-    ArtifactEngineBuilder retrievalCache(RetrievalResultCache retrievalCache) {
-      this.retrievalCache = retrievalCache;
-      return this;
-    }
-
-    ArtifactEngineBuilder extractors(TextExtractorFactory extractors) {
-      this.extractors = extractors;
-      return this;
-    }
-
-    ArtifactEngineBuilder chunker(Chunker chunker) {
-      this.chunker = chunker;
-      return this;
-    }
-
-    ArtifactEngineBuilder indexOptions(IndexJob.Options indexOptions) {
-      this.indexOptions = indexOptions;
-      return this;
-    }
-
-    ArtifactEngineBuilder storageKeys(StorageKeyFactory storageKeys) {
-      this.storageKeys = storageKeys;
-      return this;
-    }
-
-    /**
-     * Supplies content deduplication, the retrieval candidate multiplier, and the multipart part
-     * size; see the property names on {@link DefaultArtifactJobFactory}.
-     */
-    ArtifactEngineBuilder environment(Environment environment) {
-      this.environment = environment;
-      return this;
-    }
-
-    /** When false the workflow manager is wired but never started. */
-    ArtifactEngineBuilder backgroundWorkers(boolean backgroundWorkers) {
-      this.backgroundWorkers = backgroundWorkers;
-      return this;
-    }
-
-    ArtifactEngineBuilder initialWorkers(List<WorkerManager.WorkerConfiguration> initialWorkers) {
-      this.initialWorkers = initialWorkers;
-      return this;
-    }
-
-    ArtifactEngineBuilder maxWorkers(int maxWorkers) {
-      this.maxWorkers = maxWorkers;
-      return this;
-    }
-
-    ArtifactEngineBuilder workerLease(Duration workerLease) {
-      this.workerLease = workerLease;
-      return this;
-    }
-
-    ArtifactEngineBuilder workflowPollInterval(Duration workflowPollInterval) {
-      this.workflowPollInterval = workflowPollInterval;
-      return this;
-    }
-
-    /** When false crashed workflows are neither retried nor dead-lettered by this process. */
-    ArtifactEngineBuilder workflowRetries(boolean workflowRetries) {
-      this.workflowRetries = workflowRetries;
-      return this;
-    }
-
-    ArtifactEngineBuilder retrySchedule(TriggerSchedule retrySchedule) {
-      this.retrySchedule = retrySchedule;
-      return this;
-    }
-
-    ArtifactEngineBuilder retryPolicy(RetryPolicy retryPolicy) {
-      this.retryPolicy = retryPolicy;
-      return this;
-    }
-
-    ArtifactEngineBuilder retryBatchSize(int retryBatchSize) {
-      this.retryBatchSize = retryBatchSize;
-      return this;
-    }
-
-    /** Defaults to a process-local queue that does not survive a restart. */
-    ArtifactEngineBuilder deadLetters(DeadLetterQueue deadLetters) {
-      this.deadLetters = deadLetters;
-      return this;
-    }
-
-    /**
-     * Defaults to logging the letter and aborting any multipart upload the workflow left
-     * unfinished.
-     */
-    ArtifactEngineBuilder deadLetterHandler(DeadLetterHandler deadLetterHandler) {
-      this.deadLetterHandler = deadLetterHandler;
-      return this;
-    }
-
-    // Each executor defaults to the component's own daemon-thread executor. The component that
-    // receives one owns it and shuts it down when the provider closes.
-
-    ArtifactEngineBuilder queueMaintenanceExecutor(ScheduledExecutorService executor) {
-      this.queueMaintenanceExecutor = executor;
-      return this;
-    }
-
-    ArtifactEngineBuilder workerExecutors(Worker.ExecutorFactory workerExecutors) {
-      this.workerExecutors = workerExecutors;
-      return this;
-    }
-
-    ArtifactEngineBuilder workflowExecutor(ScheduledExecutorService executor) {
-      this.workflowExecutor = executor;
-      return this;
-    }
-
-    ArtifactEngineBuilder retryExecutor(ScheduledExecutorService executor) {
-      this.retryExecutor = executor;
-      return this;
-    }
-
-    /** Must reject work it cannot take; see {@link dev.notify.artifact.worker.DirectJobWorker}. */
-    ArtifactEngineBuilder directJobExecutor(ExecutorService executor) {
-      this.directJobExecutor = executor;
-      return this;
-    }
-
-    private DeadLetterHandler defaultDeadLetterHandler() {
+  private DeadLetterHandler defaultDeadLetterHandler(MultipartUploadStore multipartUploads, ObjectStore objects) {
       return DeadLetterHandler.composite(
           List.<DeadLetterHandler>of(
               letter ->
@@ -453,6 +244,270 @@ public final class DefaultArtifactMcpEngineProvider implements ArtifactMcpEngine
                       letter.attempts(),
                       letter.failureMessage()),
               new MultipartUploadCleaner(multipartUploads, objects)));
+    }
+
+  /**
+   * Collects the dependencies of the engine; {@link #build()} wires them into one.
+   *
+   * <p>Only the object store, spool, embeddings, and authorization must be supplied: they have no
+   * meaningful default. Everything else starts with a default and a setter replaces it. The
+   * stores default to process-local ones that lose their contents on restart.
+   */
+  public final class ArtifactEngineBuilder {
+    private ObjectStore objects;
+    private DurableSpool spool;
+    private EmbeddingService embeddings;
+    private AuthorizationService authorization;
+    private MetadataStore metadata;
+    private VectorStore vectors;
+    private JobStore jobStore;
+    private WorkflowStore workflowStore;
+    private MultipartUploadStore multipartUploads;
+    private RetrievalResultCache retrievalCache;
+    private TextExtractorFactory extractors;
+    private Chunker chunker;
+    private IndexJob.Options indexOptions;
+    private StorageKeyFactory storageKeys;
+    private Environment environment;
+
+    private Boolean backgroundWorkers;
+    private List<WorkerManager.WorkerConfiguration> initialWorkers;
+    private Integer maxWorkers;
+    private Duration workerLease;
+    private Duration workflowPollInterval;
+    private Boolean workflowRetries;
+    private TriggerSchedule retrySchedule;
+    private RetryPolicy retryPolicy;
+    private Integer retryBatchSize;
+    private DeadLetterQueue deadLetters;
+
+    // Left null until build(): the default handler and executors depend on other settings or hold
+    // threads, so they are created only if none was supplied.
+    private DeadLetterHandler deadLetterHandler;
+    // Optional, with no default: the engine runs without them.
+    private Ocr ocr;
+    private WorkerSnapshotStore workerSnapshots;
+    private ScheduledExecutorService queueMaintenanceExecutor;
+    private Worker.ExecutorFactory workerExecutors;
+    private ScheduledExecutorService workflowExecutor;
+    private ScheduledExecutorService retryExecutor;
+    private ExecutorService directJobExecutor;
+
+    ArtifactEngineBuilder metadata(MetadataStore metadata) {
+      if(this.metadata==null)
+        this.metadata = metadata;
+      return this;
+    }
+
+    ArtifactEngineBuilder vectors(VectorStore vectors) {
+      if(this.vectors==null)
+        this.vectors = vectors;
+      return this;
+    }
+
+    ArtifactEngineBuilder jobStore(JobStore jobStore) {
+      if(this.jobStore==null)
+        this.jobStore = jobStore;
+      return this;
+    }
+
+    ArtifactEngineBuilder workflowStore(WorkflowStore workflowStore) {
+      if(this.workflowStore==null)
+        this.workflowStore = workflowStore;
+      return this;
+    }
+
+    ArtifactEngineBuilder multipartUploads(MultipartUploadStore multipartUploads) {
+      if(this.multipartUploads==null)
+        this.multipartUploads = multipartUploads;
+      return this;
+    }
+
+    ArtifactEngineBuilder objects(ObjectStore objects) {
+      if(this.objects==null)
+        this.objects = objects;
+      return this;
+    }
+
+    ArtifactEngineBuilder spool(DurableSpool spool) {
+      if(this.spool==null)
+        this.spool = spool;
+      return this;
+    }
+
+    ArtifactEngineBuilder embeddings(EmbeddingService embeddings) {
+      if(this.embeddings==null)
+        this.embeddings = embeddings;
+      return this;
+    }
+
+    ArtifactEngineBuilder authorization(AuthorizationService authorization) {
+      if(this.authorization==null)
+        this.authorization = authorization;
+      return this;
+    }
+
+    /** Null disables search result caching. */
+    ArtifactEngineBuilder retrievalCache(RetrievalResultCache retrievalCache) {
+      if(this.retrievalCache==null)
+        this.retrievalCache = retrievalCache;
+      return this;
+    }
+
+    ArtifactEngineBuilder extractors(TextExtractorFactory extractors) {
+      if(this.extractors==null)
+        this.extractors = extractors;
+      return this;
+    }
+
+    ArtifactEngineBuilder chunker(Chunker chunker) {
+      if(this.chunker==null)
+        this.chunker = chunker;
+      return this;
+    }
+
+    ArtifactEngineBuilder indexOptions(IndexJob.Options indexOptions) {
+      if(this.indexOptions==null)
+        this.indexOptions = indexOptions;
+      return this;
+    }
+
+    ArtifactEngineBuilder storageKeys(StorageKeyFactory storageKeys) {
+      if(this.storageKeys==null)
+        this.storageKeys = storageKeys;
+      return this;
+    }
+
+    /**
+     * Supplies content deduplication, the retrieval candidate multiplier, and the multipart part
+     * size; see the property names on {@link DefaultArtifactJobFactory}.
+     */
+    ArtifactEngineBuilder environment(Environment environment) {
+      if(this.environment==null)
+        this.environment = environment;
+      return this;
+    }
+
+    /** When false the workflow manager is wired but never started. */
+    ArtifactEngineBuilder backgroundWorkers(Boolean backgroundWorkers) {
+      if(this.backgroundWorkers==null)
+        this.backgroundWorkers = backgroundWorkers;
+      return this;
+    }
+
+    ArtifactEngineBuilder initialWorkers(List<WorkerManager.WorkerConfiguration> initialWorkers) {
+      if(this.initialWorkers==null)
+        this.initialWorkers = initialWorkers;
+      return this;
+    }
+
+    ArtifactEngineBuilder maxWorkers(Integer maxWorkers) {
+      if(this.maxWorkers==null)
+        this.maxWorkers = maxWorkers;
+      return this;
+    }
+
+    ArtifactEngineBuilder workerLease(Duration workerLease) {
+      if(this.workerLease==null)
+        this.workerLease = workerLease;
+      return this;
+    }
+
+    ArtifactEngineBuilder workflowPollInterval(Duration workflowPollInterval) {
+      if(this.workflowPollInterval==null)
+        this.workflowPollInterval = workflowPollInterval;
+      return this;
+    }
+
+    /** When false crashed workflows are neither retried nor dead-lettered by this process. */
+    ArtifactEngineBuilder workflowRetries(Boolean workflowRetries) {
+      if(this.workflowRetries==null)
+        this.workflowRetries = workflowRetries;
+      return this;
+    }
+
+    ArtifactEngineBuilder retrySchedule(TriggerSchedule retrySchedule) {
+      if(this.retrySchedule==null)
+        this.retrySchedule = retrySchedule;
+      return this;
+    }
+
+    ArtifactEngineBuilder retryPolicy(RetryPolicy retryPolicy) {
+      if(this.retryPolicy==null)
+        this.retryPolicy = retryPolicy;
+      return this;
+    }
+
+    ArtifactEngineBuilder retryBatchSize(Integer retryBatchSize) {
+      if(this.retryBatchSize==null)
+        this.retryBatchSize = retryBatchSize;
+      return this;
+    }
+
+    /** Optional; without it, images without extractable text fail indexing. */
+    ArtifactEngineBuilder ocr(Ocr ocr) {
+      this.ocr = ocr;
+      return this;
+    }
+
+    /**
+     * Optional; backs the engine's {@code restoreWorkers} and {@code saveWorkerSnapshots}. Without
+     * it the worker topology is not persisted.
+     */
+    ArtifactEngineBuilder workerSnapshots(WorkerSnapshotStore workerSnapshots) {
+      this.workerSnapshots = workerSnapshots;
+      return this;
+    }
+
+    /** Defaults to a process-local queue that does not survive a restart. */
+    ArtifactEngineBuilder deadLetters(DeadLetterQueue deadLetters) {
+      if(this.deadLetters==null)
+      this.deadLetters = deadLetters;
+      return this;
+    }
+
+    /**
+     * Defaults to logging the letter and aborting any multipart upload the workflow left
+     * unfinished.
+     */
+    ArtifactEngineBuilder deadLetterHandler(DeadLetterHandler deadLetterHandler) {
+      if(this.deadLetterHandler==null)
+        this.deadLetterHandler = deadLetterHandler;
+      return this;
+    }
+
+    // Each executor defaults to the component's own daemon-thread executor. The component that
+    // receives one owns it and shuts it down when the provider closes.
+
+    ArtifactEngineBuilder queueMaintenanceExecutor(ScheduledExecutorService executor) {
+      if(this.queueMaintenanceExecutor==null)
+        this.queueMaintenanceExecutor = executor;
+      return this;
+    }
+
+    ArtifactEngineBuilder workerExecutors(Worker.ExecutorFactory workerExecutors) {
+      if(this.workerExecutors==null)
+        this.workerExecutors = workerExecutors;
+      return this;
+    }
+
+    ArtifactEngineBuilder workflowExecutor(ScheduledExecutorService executor) {
+      if(this.workflowExecutor==null)
+        this.workflowExecutor = executor;
+      return this;
+    }
+
+    ArtifactEngineBuilder retryExecutor(ScheduledExecutorService executor) {
+      if(this.retryExecutor==null)
+        this.retryExecutor = executor;
+      return this;
+    }
+
+    /** Must reject work it cannot take; see {@link dev.notify.artifact.worker.DirectJobWorker}. */
+    ArtifactEngineBuilder directJobExecutor(ExecutorService executor) {
+      if(this.directJobExecutor==null)
+        this.directJobExecutor = executor;
+      return this;
     }
 
     /**
@@ -481,7 +536,7 @@ public final class DefaultArtifactMcpEngineProvider implements ArtifactMcpEngine
               vectors,
               embeddings,
               extractors,
-              null,
+              ocr,
               chunker,
               indexOptions,
               multipartUploads,
@@ -492,14 +547,12 @@ public final class DefaultArtifactMcpEngineProvider implements ArtifactMcpEngine
               ignored -> new InMemoryJobQueue(),
               Duration.ofSeconds(30),
               failure -> {},
-              queueMaintenanceExecutor == null
-                  ? QueueManager.defaultExecutor()
-                  : queueMaintenanceExecutor);
+              queueMaintenanceExecutor);
       queueManager.start();
       workerManager =
           new WorkerManager(
               failure -> LOGGER.log(System.Logger.Level.WARNING, "Artifact job failed", failure.cause()),
-              null,
+              workerSnapshots,
               initialWorkers,
               maxWorkers,
               queueManager,
@@ -507,9 +560,7 @@ public final class DefaultArtifactMcpEngineProvider implements ArtifactMcpEngine
               jobStore,
               workerLease,
               WorkerManager.DEFAULT_POLL_INTERVAL,
-              workerExecutors == null
-                  ? Worker.ExecutorFactory.defaults()
-                  : workerExecutors);
+              workerExecutors);
       workflowManager =
           new WorkflowManager(
               workflowStore,
@@ -518,9 +569,8 @@ public final class DefaultArtifactMcpEngineProvider implements ArtifactMcpEngine
               failure ->
                   LOGGER.log(System.Logger.Level.WARNING, "Artifact workflow dispatch failed", failure),
               workerManager,
-              workflowExecutor == null
-                  ? WorkflowManager.defaultExecutor()
-                  : workflowExecutor);
+              workflowExecutor);
+
       workflowManager.addCrashListener(spoolReleaser.onWorkflowCrashed());
       if (backgroundWorkers) {
         workflowManager.start();
@@ -534,16 +584,12 @@ public final class DefaultArtifactMcpEngineProvider implements ArtifactMcpEngine
               retryPolicy,
               retrySchedule,
               deadLetters,
-              deadLetterHandler == null
-                  ? defaultDeadLetterHandler()
-                  : deadLetterHandler,
+              deadLetterHandler,
               Clock.systemUTC(),
               retryBatchSize,
               failure ->
                   LOGGER.log(System.Logger.Level.WARNING, "Artifact workflow retry failed", failure),
-              retryExecutor == null
-                  ? WorkflowRetryScheduler.defaultExecutor()
-                  : retryExecutor);
+              retryExecutor);
       if (workflowRetries) {
         retryScheduler.start();
       }
@@ -563,9 +609,8 @@ public final class DefaultArtifactMcpEngineProvider implements ArtifactMcpEngine
               retrievalCache);
       directJobWorker =
           new dev.notify.artifact.worker.DirectJobWorker(
-              directJobExecutor == null
-                  ? dev.notify.artifact.worker.DirectJobWorker.defaultExecutor(4, 256)
-                  : directJobExecutor);
+              directJobExecutor);
+
       JobDispatcher directDispatcher =
           new dev.notify.artifact.dispatcher.DirectJobDispatcher(directJobWorker);
       QueuingJobDispatcher queuingDispatcher =
