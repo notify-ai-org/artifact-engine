@@ -69,10 +69,43 @@ class DefaultArtifactMcpEngineProviderTest {
     ArtifactEngine engine = provider.createEngine(environment);
     assertNotNull(engine);
     assertEquals(java.util.List.of(), engine.listMetadata("principal-a", "tenant-a", 10));
+    // The process is bound to its tenant; principals arrive with each request.
+    assertEquals(java.util.List.of(), engine.listMetadata("different-principal", "tenant-a", 10));
     assertThrows(
         SecurityException.class,
-        () -> engine.listMetadata("different-principal", "tenant-a", 10));
+        () -> engine.listMetadata("principal-a", "different-tenant", 10));
     provider.close();
+  }
+
+  @Test
+  void readOnlyEngineServesRetrievalWithoutObjectStorageOrBackgroundWork() throws Exception {
+    // No S3 bucket, KMS key or spool: a read-only engine must not need them.
+    var environment =
+        new StandardEnvironment(
+            new MapEnvironmentSource(
+                "test",
+                Map.of(
+                    "ARTIFACT_READ_ONLY", "true",
+                    "ARTIFACT_MCP_TENANT_ID", "tenant-a",
+                    "ARTIFACT_MCP_SCOPES", "artifact.metadata,artifact.search")));
+    var provider = new DefaultArtifactEngineProvider();
+    try {
+      ArtifactEngine engine = provider.createEngine(environment);
+
+      assertEquals(java.util.List.of(), engine.listMetadata("principal-a", "tenant-a", 10));
+      assertThrows(UnsupportedOperationException.class, engine::workers);
+      assertThrows(
+          UnsupportedOperationException.class,
+          () -> engine.addQueue(JobRecord.JobType.INDEX, new InMemoryJobQueue()));
+      assertThrows(
+          UnsupportedOperationException.class,
+          () -> engine.delete("principal-a", "tenant-a", "artifact-1"));
+      assertThrows(
+          UnsupportedOperationException.class,
+          () -> engine.content("principal-a", "tenant-a", "artifact-1"));
+    } finally {
+      provider.close();
+    }
   }
 
   @Test

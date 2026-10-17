@@ -27,6 +27,7 @@ public final class RetrievalJob extends AbstractJob<List<Requests.SearchHit>>
   private final EmbeddingService embeddingService;
   private final ArtifactAccessVerifier accessVerifier;
   private final int retrievalCandidateMultiplier;
+  private final double minSemanticScore;
   private final RetrievalResultCache resultCache;
 
   public RetrievalJob(
@@ -49,6 +50,23 @@ public final class RetrievalJob extends AbstractJob<List<Requests.SearchHit>>
       ArtifactAccessVerifier accessVerifier,
       int retrievalCandidateMultiplier,
       RetrievalResultCache resultCache) {
+    this(request, metadataStore, vectorStore, embeddingService, accessVerifier,
+        retrievalCandidateMultiplier, 0.0, resultCache);
+  }
+
+  /**
+   * @param minSemanticScore cosine similarity a semantic candidate needs before fusion; rank fusion
+   *     discards absolute relevance, so without it the nearest chunk is returned however unrelated
+   */
+  public RetrievalJob(
+      Requests.Search request,
+      MetadataStore metadataStore,
+      VectorStore vectorStore,
+      EmbeddingService embeddingService,
+      ArtifactAccessVerifier accessVerifier,
+      int retrievalCandidateMultiplier,
+      double minSemanticScore,
+      RetrievalResultCache resultCache) {
     super(accessVerifier, metadataStore);
     this.resultCache = resultCache;
     this.request = request;
@@ -56,6 +74,7 @@ public final class RetrievalJob extends AbstractJob<List<Requests.SearchHit>>
     this.embeddingService = embeddingService;
     this.accessVerifier = accessVerifier;
     this.retrievalCandidateMultiplier = retrievalCandidateMultiplier;
+    this.minSemanticScore = minSemanticScore;
   }
 
   @Override
@@ -70,7 +89,9 @@ public final class RetrievalJob extends AbstractJob<List<Requests.SearchHit>>
     VectorStore.SearchFilter storeFilter =
         new VectorStore.SearchFilter(request.mediaTypes(), request.tags());
     List<VectorStore.ScoredChunk> semantic =
-        vectorStore.search(request.tenantId(), queryEmbedding, candidateLimit, storeFilter);
+        vectorStore.search(request.tenantId(), queryEmbedding, candidateLimit, storeFilter).stream()
+            .filter(hit -> hit.score() >= minSemanticScore)
+            .toList();
     List<VectorStore.ScoredChunk> keyword =
         vectorStore.keywordSearch(request.tenantId(), request.query(), candidateLimit, storeFilter);
     return fuseAndFilter(semantic, keyword);

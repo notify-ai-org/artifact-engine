@@ -34,12 +34,34 @@ public final class ArtifactMcpStdioMain {
 
   private ArtifactMcpStdioMain() {}
 
-  public static void main(String[] args) throws InterruptedException {
+  public static void main(String[] args) {
     InputStream protocolInput = System.in;
     PrintStream protocolOutput = System.out;
     // Reserve the original stdout stream for JSON-RPC before any provider can emit a log line.
     System.setOut(System.err);
 
+    try {
+      start(args, protocolInput, protocolOutput);
+    } catch (Throwable failure) {
+      // Exit at once: the JDBC pool and HTTP clients start non-daemon threads that would otherwise
+      // keep a half-started process alive until the host's initialization timeout expires.
+      System.err.println("Artifact MCP stdio server failed to start: " + failure);
+      failure.printStackTrace(System.err);
+      System.exit(1);
+      return;
+    }
+
+    // stdout belongs exclusively to MCP. Operational diagnostics must use stderr.
+    System.err.println("Artifact MCP stdio server ready");
+    try {
+      new CountDownLatch(1).await();
+    } catch (InterruptedException interrupted) {
+      Thread.currentThread().interrupt();
+      System.exit(0);
+    }
+  }
+
+  private static void start(String[] args, InputStream protocolInput, PrintStream protocolOutput) {
     Environment environment = environment(args);
     ArtifactEngineProvider provider = new DefaultArtifactEngineProvider();
     ArtifactEngine engine = provider.createEngine(environment);
@@ -48,18 +70,28 @@ public final class ArtifactMcpStdioMain {
             engine,
             positiveInt(environment, MAX_TEXT_ENV, DEFAULT_MAX_TEXT_CHARACTERS),
             positiveInt(environment, MAX_CONTENT_ENV, DEFAULT_MAX_CONTENT_BYTES));
-    McpArtifactGateway.Session session =
+    // Tenant and scope ceiling are fixed for the process; each request supplies its principal.
+    McpArtifactGateway.Session processSession =
         new McpArtifactGateway.Session(
             requiredEnvironment(environment, PRINCIPAL_ENV),
             requiredEnvironment(environment, TENANT_ENV),
             scopes(requiredEnvironment(environment, SCOPES_ENV)));
+    // A read-only engine has no object store, so the original-bytes tool is not offered.
+    boolean readOnly =
+        "true".equalsIgnoreCase(environment.getProperty(DefaultArtifactEngineProvider.READ_ONLY_ENV));
     ArtifactMcpStdioServer server =
         new ArtifactMcpStdioServer(
             gateway,
-            session,
+            new McpRequestIdentity(processSession),
+            !readOnly,
             Duration.ofSeconds(positiveInt(environment, TIMEOUT_ENV, DEFAULT_TIMEOUT_SECONDS)),
             protocolInput,
-            protocolOutput);
+            protocolOutput,
+            () -> {
+              // The host closed our stdin: it exited or dropped this process. Do not linger.
+              System.err.println("Artifact MCP stdin closed; exiting");
+              System.exit(0);
+            });
 
     Runtime.getRuntime()
         .addShutdownHook(
@@ -69,10 +101,6 @@ public final class ArtifactMcpStdioMain {
                   provider.close();
                 },
                 "artifact-mcp-shutdown"));
-
-    // stdout belongs exclusively to MCP. Operational diagnostics must use stderr.
-    System.err.println("Artifact MCP stdio server ready");
-    new CountDownLatch(1).await();
   }
 
   static Environment environment(String[] args) {

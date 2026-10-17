@@ -27,7 +27,10 @@ import java.util.Objects;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-/** Builds the MCP tools and resources backed by a single tenant-bound gateway session. */
+/**
+ * Builds the MCP tools and resources for a tenant-bound process. Each request is served with the
+ * session {@link McpRequestIdentity} resolves from its {@code _meta}.
+ */
 public final class ArtifactMcpServerFeatures {
   public static final String SEARCH_TOOL = "artifact_search";
   public static final String METADATA_TOOL = "artifact_metadata";
@@ -44,22 +47,34 @@ public final class ArtifactMcpServerFeatures {
       Pattern.compile("artifact://([A-Za-z0-9][A-Za-z0-9._-]{0,127})/(metadata|text|content)");
 
   private final McpArtifactGateway gateway;
-  private final McpArtifactGateway.Session session;
+  private final McpRequestIdentity identity;
+  private final boolean contentEnabled;
   private final ObjectMapper objectMapper;
 
   public ArtifactMcpServerFeatures(
       McpArtifactGateway gateway, McpArtifactGateway.Session session) {
+    this(gateway, new McpRequestIdentity(session), true);
+  }
+
+  /** @param contentEnabled false leaves out the original-bytes tool and resource */
+  public ArtifactMcpServerFeatures(
+      McpArtifactGateway gateway, McpRequestIdentity identity, boolean contentEnabled) {
     this.gateway = Objects.requireNonNull(gateway, "gateway");
-    this.session = Objects.requireNonNull(session, "session");
+    this.identity = Objects.requireNonNull(identity, "identity");
+    this.contentEnabled = contentEnabled;
     this.objectMapper = new ObjectMapper().registerModule(new JavaTimeModule());
   }
 
   public List<SyncToolSpecification> tools() {
-    return List.of(searchTool(), metadataTool(), textTool(), contentTool());
+    return contentEnabled
+        ? List.of(searchTool(), metadataTool(), textTool(), contentTool())
+        : List.of(searchTool(), metadataTool(), textTool());
   }
 
   public List<SyncResourceTemplateSpecification> resourceTemplates() {
-    return List.of(metadataResource(), textResource(), contentResource());
+    return contentEnabled
+        ? List.of(metadataResource(), textResource(), contentResource())
+        : List.of(metadataResource(), textResource());
   }
 
   private SyncToolSpecification searchTool() {
@@ -168,7 +183,7 @@ public final class ArtifactMcpServerFeatures {
     return new SyncResourceTemplateSpecification(template, (exchange, request) -> read(request));
   }
 
-  private Map<String, Object> search(CallToolRequest request) {
+  private Map<String, Object> search(McpArtifactGateway.Session session, CallToolRequest request) {
     Map<String, Object> arguments = arguments(request);
     String query = requiredString(arguments, "query", MAX_QUERY_CHARACTERS);
     int limit = integer(arguments, "limit", DEFAULT_SEARCH_LIMIT, 1, 100);
@@ -187,12 +202,12 @@ public final class ArtifactMcpServerFeatures {
     return Map.of("results", results, "untrustedContent", true);
   }
 
-  private Map<String, Object> metadata(CallToolRequest request) {
+  private Map<String, Object> metadata(McpArtifactGateway.Session session, CallToolRequest request) {
     String artifactId = artifactId(arguments(request));
     return metadataMap(gateway.getArtifactMetadata(session, artifactId));
   }
 
-  private Map<String, Object> text(CallToolRequest request) {
+  private Map<String, Object> text(McpArtifactGateway.Session session, CallToolRequest request) {
     Map<String, Object> arguments = arguments(request);
     String artifactId = artifactId(arguments);
     Integer maxCharacters = optionalInteger(arguments, "maxCharacters", 1, Integer.MAX_VALUE);
@@ -205,7 +220,8 @@ public final class ArtifactMcpServerFeatures {
     return response;
   }
 
-  private Map<String, Object> content(CallToolRequest request) throws IOException {
+  private Map<String, Object> content(McpArtifactGateway.Session session, CallToolRequest request)
+      throws IOException {
     Map<String, Object> arguments = arguments(request);
     String artifactId = artifactId(arguments);
     long offset = longValue(arguments, "offset", 0, 0, Long.MAX_VALUE);
@@ -220,7 +236,11 @@ public final class ArtifactMcpServerFeatures {
     }
     String artifactId = matcher.group(1);
     String kind = matcher.group(2);
+    if ("content".equals(kind) && !contentEnabled) {
+      throw new IllegalArgumentException("Unsupported artifact resource URI");
+    }
     try {
+      McpArtifactGateway.Session session = identity.resolve(request.meta());
       return switch (kind) {
         case "metadata" ->
             new ReadResourceResult(
@@ -234,7 +254,7 @@ public final class ArtifactMcpServerFeatures {
           yield new ReadResourceResult(
               List.of(new TextResourceContents(request.uri(), "text/plain", result.text())));
         }
-        case "content" -> contentResource(request.uri(), artifactId);
+        case "content" -> contentResource(session, request.uri(), artifactId);
         default -> throw new IllegalArgumentException("Unsupported artifact resource URI");
       };
     } catch (SecurityException exception) {
@@ -246,7 +266,8 @@ public final class ArtifactMcpServerFeatures {
     }
   }
 
-  private ReadResourceResult contentResource(String uri, String artifactId) throws IOException {
+  private ReadResourceResult contentResource(
+      McpArtifactGateway.Session session, String uri, String artifactId) throws IOException {
     McpArtifactGateway.ContentChunkResult chunk =
         gateway.getArtifactContentChunk(session, artifactId, 0, null);
     if (chunk.endOfFile()) {
@@ -263,7 +284,7 @@ public final class ArtifactMcpServerFeatures {
 
   private CallToolResult call(ToolHandler handler, CallToolRequest request) {
     try {
-      Map<String, Object> result = handler.handle(request);
+      Map<String, Object> result = handler.handle(identity.resolve(request.meta()), request);
       return CallToolResult.builder()
           .structuredContent(result)
           .addTextContent(json(result))
@@ -282,7 +303,7 @@ public final class ArtifactMcpServerFeatures {
 
   private CallToolResult callContent(CallToolRequest request) {
     try {
-      Map<String, Object> result = content(request);
+      Map<String, Object> result = content(identity.resolve(request.meta()), request);
       String base64 = String.valueOf(result.remove("base64"));
       String mediaType = String.valueOf(result.get("mediaType"));
       String artifactId = artifactId(arguments(request));
@@ -485,7 +506,8 @@ public final class ArtifactMcpServerFeatures {
 
   @FunctionalInterface
   private interface ToolHandler {
-    Map<String, Object> handle(CallToolRequest request) throws IOException;
+    Map<String, Object> handle(McpArtifactGateway.Session session, CallToolRequest request)
+        throws IOException;
   }
 
   private static final class ArtifactMcpException extends RuntimeException {

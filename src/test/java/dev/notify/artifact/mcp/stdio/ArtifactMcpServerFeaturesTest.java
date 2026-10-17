@@ -2,6 +2,8 @@ package dev.notify.artifact.mcp.stdio;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import dev.notify.artifact.mcp.McpArtifactGateway;
 import dev.notify.artifact.mcp.McpArtifactGatewayTest.RecordingEngine;
@@ -10,6 +12,7 @@ import io.modelcontextprotocol.spec.McpSchema.CallToolRequest;
 import io.modelcontextprotocol.spec.McpSchema.CallToolResult;
 import io.modelcontextprotocol.spec.McpSchema.BlobResourceContents;
 import io.modelcontextprotocol.spec.McpSchema.EmbeddedResource;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import org.junit.jupiter.api.Test;
@@ -79,6 +82,83 @@ class ArtifactMcpServerFeaturesTest {
     BlobResourceContents blob = (BlobResourceContents) embedded.resource();
     assertEquals("YWJjZA==", blob.blob());
     assertEquals(4L, structured.get("nextOffset"));
+  }
+
+  @Test
+  void requestMetaSuppliesThePrincipalWhileTheTenantStaysProcessBound() {
+    RecordingEngine engine = new RecordingEngine("content");
+
+    CallToolResult result = callMetadata(features(engine), Map.of(
+        McpRequestIdentity.PRINCIPAL_META, "principal-b",
+        McpRequestIdentity.TENANT_META, "tenant-a"));
+
+    assertFalse(Boolean.TRUE.equals(result.isError()));
+    assertEquals("principal-b", engine.lastPrincipal);
+    assertEquals("tenant-a", engine.lastTenant);
+  }
+
+  @Test
+  @SuppressWarnings("unchecked")
+  void requestForAnotherTenantIsForbidden() {
+    RecordingEngine engine = new RecordingEngine("content");
+
+    CallToolResult result = callMetadata(features(engine), Map.of(
+        McpRequestIdentity.PRINCIPAL_META, "principal-b",
+        McpRequestIdentity.TENANT_META, "tenant-b"));
+
+    assertTrue(result.isError());
+    assertEquals("FORBIDDEN", ((Map<String, Object>) result.structuredContent()).get("error"));
+    assertNull(engine.lastTenant);
+  }
+
+  @Test
+  @SuppressWarnings("unchecked")
+  void requestScopesNarrowButNeverWidenTheProcessCeiling() {
+    RecordingEngine engine = new RecordingEngine("content");
+    McpArtifactGateway gateway = new McpArtifactGateway(engine, 100, 4);
+    ArtifactMcpServerFeatures searchOnly = new ArtifactMcpServerFeatures(
+        gateway,
+        new McpRequestIdentity(new McpArtifactGateway.Session(
+            "principal-a", "tenant-a", Set.of("artifact.search"))),
+        false);
+
+    CallToolResult widened = callMetadata(searchOnly, Map.of(
+        McpRequestIdentity.SCOPES_META, List.of("artifact.metadata", "artifact.*")));
+    CallToolResult narrowed = callMetadata(features(engine), Map.of(
+        McpRequestIdentity.SCOPES_META, List.of("artifact.search")));
+
+    assertEquals("FORBIDDEN", ((Map<String, Object>) widened.structuredContent()).get("error"));
+    assertEquals("FORBIDDEN", ((Map<String, Object>) narrowed.structuredContent()).get("error"));
+  }
+
+  @Test
+  void readOnlyProcessesDoNotOfferOriginalContent() {
+    McpArtifactGateway gateway = new McpArtifactGateway(new RecordingEngine("content"), 100, 4);
+    ArtifactMcpServerFeatures features = new ArtifactMcpServerFeatures(
+        gateway,
+        new McpRequestIdentity(new McpArtifactGateway.Session(
+            "principal-a", "tenant-a", Set.of("artifact.*"))),
+        false);
+
+    assertEquals(
+        List.of(
+            ArtifactMcpServerFeatures.SEARCH_TOOL,
+            ArtifactMcpServerFeatures.METADATA_TOOL,
+            ArtifactMcpServerFeatures.TEXT_TOOL),
+        features.tools().stream().map(specification -> specification.tool().name()).toList());
+    assertEquals(2, features.resourceTemplates().size());
+  }
+
+  private static CallToolResult callMetadata(
+      ArtifactMcpServerFeatures features, Map<String, Object> meta) {
+    SyncToolSpecification specification = features.tools().stream()
+        .filter(candidate -> ArtifactMcpServerFeatures.METADATA_TOOL.equals(candidate.tool().name()))
+        .findFirst()
+        .orElseThrow();
+    return specification.callHandler().apply(
+        null,
+        new CallToolRequest(
+            ArtifactMcpServerFeatures.METADATA_TOOL, Map.of("artifactId", "artifact-1"), meta));
   }
 
   private static ArtifactMcpServerFeatures features(RecordingEngine engine) {

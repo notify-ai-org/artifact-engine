@@ -42,6 +42,12 @@ public final class DefaultArtifactJobFactory implements ArtifactJobFactory {
       "ARTIFACT_RETRIEVAL_CANDIDATE_MULTIPLIER";
 
   /**
+   * 0 to 1, default 0.3: cosine similarity a semantic search candidate needs to be returned. With
+   * text-embedding-3-small, related chunks typically score above 0.4 and unrelated ones below 0.25.
+   */
+  public static final String RETRIEVAL_MIN_SEMANTIC_SCORE = "ARTIFACT_RETRIEVAL_MIN_SEMANTIC_SCORE";
+
+  /**
    * Part size for multipart object uploads, default 64 MiB. Artifacts larger than one part are
    * stored as a multipart upload with parts uploaded in parallel. {@code 0} disables it and every
    * artifact is stored with a single upload.
@@ -53,6 +59,7 @@ public final class DefaultArtifactJobFactory implements ArtifactJobFactory {
 
   private final boolean deduplicateContent;
   private final int retrievalCandidateMultiplier;
+  private final double minSemanticScore;
   private final long multipartPartBytes;
   private final WorkflowManager workflowManager;
   private final ChunkedIngestSupport chunkedIngest;
@@ -133,6 +140,7 @@ public final class DefaultArtifactJobFactory implements ArtifactJobFactory {
     Objects.requireNonNull(environment, "environment");
     this.deduplicateContent = deduplicateContent(environment);
     this.retrievalCandidateMultiplier = retrievalCandidateMultiplier(environment);
+    this.minSemanticScore = minSemanticScore(environment);
     this.multipartPartBytes = multipartPartBytes(environment);
     this.workflowManager = workflowManager;
   }
@@ -209,6 +217,7 @@ public final class DefaultArtifactJobFactory implements ArtifactJobFactory {
         embeddingService,
         accessVerifier,
         retrievalCandidateMultiplier,
+        minSemanticScore,
         retrievalCache);
   }
 
@@ -232,13 +241,29 @@ public final class DefaultArtifactJobFactory implements ArtifactJobFactory {
     throw new IllegalArgumentException(DEDUPLICATE_CONTENT + " must be true or false");
   }
 
-  private static int retrievalCandidateMultiplier(Environment environment) {
+  static int retrievalCandidateMultiplier(Environment environment) {
     long multiplier = number(environment, RETRIEVAL_CANDIDATE_MULTIPLIER, 4);
     if (multiplier < 1 || multiplier > 100) {
       throw new IllegalArgumentException(
           RETRIEVAL_CANDIDATE_MULTIPLIER + " must be between 1 and 100");
     }
     return (int) multiplier;
+  }
+
+  static double minSemanticScore(Environment environment) {
+    String value = property(environment, RETRIEVAL_MIN_SEMANTIC_SCORE);
+    if (value == null) return 0.3;
+    double score;
+    try {
+      score = Double.parseDouble(value);
+    } catch (NumberFormatException exception) {
+      throw new IllegalArgumentException(
+          RETRIEVAL_MIN_SEMANTIC_SCORE + " must be a number", exception);
+    }
+    if (!(score >= 0.0 && score <= 1.0)) {
+      throw new IllegalArgumentException(RETRIEVAL_MIN_SEMANTIC_SCORE + " must be between 0 and 1");
+    }
+    return score;
   }
 
   private static long multipartPartBytes(Environment environment) {

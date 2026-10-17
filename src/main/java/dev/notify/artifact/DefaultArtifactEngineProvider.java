@@ -6,7 +6,7 @@ import com.zaxxer.hikari.HikariDataSource;
 
 import dev.notify.artifact.auth.AuthorizationService;
 import dev.notify.artifact.auth.DataVerifier;
-import dev.notify.artifact.auth.DefaultAuthorizationService;
+import dev.notify.artifact.auth.TenantAuthorizationService;
 import dev.notify.artifact.auth.AuthorizationService.Permission;
 import dev.notify.artifact.dispatcher.JobDispatcher;
 import dev.notify.artifact.dispatcher.QueuingJobDispatcher;
@@ -22,6 +22,7 @@ import dev.notify.artifact.embed.OkHttpEmbeddingProvider;
 import dev.notify.artifact.environment.Environment;
 import dev.notify.artifact.environment.StandardEnvironment;
 import dev.notify.artifact.factory.DefaultArtifactJobFactory;
+import dev.notify.artifact.factory.ReadOnlyArtifactJobFactory;
 import dev.notify.artifact.retry.RetryPolicy;
 import dev.notify.artifact.cache.QueryEmbeddingCache;
 import dev.notify.artifact.cache.RetrievalResultCache;
@@ -94,6 +95,8 @@ public final class DefaultArtifactEngineProvider implements ArtifactEngineProvid
   public static final String TENANT_ENV = "ARTIFACT_MCP_TENANT_ID";
   public static final String PRINCIPAL_ENV = "ARTIFACT_MCP_PRINCIPAL_ID";
   public static final String SCOPES_ENV = "ARTIFACT_MCP_SCOPES";
+  /** {@code true} builds a retrieval-only engine; see {@link #createReadOnlyEngine}. */
+  public static final String READ_ONLY_ENV = "ARTIFACT_READ_ONLY";
   private static final System.Logger LOGGER =
       System.getLogger(DefaultArtifactEngineProvider.class.getName());
 
@@ -116,6 +119,10 @@ public final class DefaultArtifactEngineProvider implements ArtifactEngineProvid
   @Override
   public synchronized ArtifactEngine createEngine(Environment environment,ArtifactEngineBuilder builder) {
     if (engine != null) return engine;
+    if (booleanProperty(environment, READ_ONLY_ENV, false)) {
+      engine = createReadOnlyEngine(environment);
+      return engine;
+    }
     ObjectMapper objectMapper = new ObjectMapper().findAndRegisterModules();
     String jdbcUrl =
         firstNonBlank(property(environment, "ARTIFACT_JDBC_URL"), property(environment, "JDBC_DATABASE_URL"));
@@ -170,11 +177,7 @@ public final class DefaultArtifactEngineProvider implements ArtifactEngineProvid
             .authorization(authorizationService(environment))
             // Search results are cached per tenant and dropped whenever an artifact's visibility
             // changes.
-            .retrievalCache(
-                new RetrievalResultCache(
-                    positiveLong(environment, "ARTIFACT_RETRIEVAL_CACHE_MAX_BYTES", 64L * 1024 * 1024),
-                    Duration.ofSeconds(
-                        positiveLong(environment, "ARTIFACT_RETRIEVAL_CACHE_TTL_SECONDS", 300))))
+            .retrievalCache(retrievalCache(environment))
             .extractors(
                 TextExtractorFactory.defaults(
                     positiveInt(environment, "ARTIFACT_EXTRACT_MAX_INPUT_BYTES", 128 * 1024 * 1024),
@@ -225,12 +228,51 @@ public final class DefaultArtifactEngineProvider implements ArtifactEngineProvid
                     2.0,
                     0.2,
                     failure -> true))
-            .deadLetterHandler(
-                defaultDeadLetterHandler(
-                    builder.multipartUploads, builder.objects))
             .retryBatchSize(positiveInt(environment, "ARTIFACT_WORKFLOW_RETRY_BATCH_SIZE", 100))
             .build();
     return engine;
+  }
+
+  /**
+   * Retrieval only: search, metadata and extracted text over the metadata and vector stores. No S3
+   * client, spool, queue, workers, workflow manager or retry scheduler is created, so the only
+   * threads are the direct-job pool, the JDBC pool and the embedding client.
+   */
+  private ArtifactEngine createReadOnlyEngine(Environment environment) {
+    ObjectMapper objectMapper = new ObjectMapper().findAndRegisterModules();
+    String jdbcUrl =
+        firstNonBlank(property(environment, "ARTIFACT_JDBC_URL"), property(environment, "JDBC_DATABASE_URL"));
+    int vectorDimensions = positiveInt(environment, "ARTIFACT_VECTOR_DIMENSIONS", 1536);
+    MetadataStore metadata;
+    VectorStore vectors;
+    if (jdbcUrl != null) {
+      dataSource =
+          dataSource(
+              environment, jdbcUrl, positiveInt(environment, "ARTIFACT_READ_ONLY_JDBC_MAX_POOL_SIZE", 4));
+      Jdbi jdbi = Jdbi.create(dataSource);
+      metadata = new JdbiMetadataStore(jdbi, objectMapper);
+      vectors = new JdbiVectorStore(jdbi, objectMapper, vectorDimensions);
+    } else {
+      metadata = new InMemoryStores.Metadata();
+      vectors = new InMemoryStores.Vectors();
+    }
+    EmbeddingRuntime embeddingRuntime = embeddingService(environment, objectMapper, vectorDimensions);
+    embeddingService = embeddingRuntime.service();
+    embeddingHttpClient = embeddingRuntime.client();
+    ReadOnlyArtifactJobFactory jobs =
+        new ReadOnlyArtifactJobFactory(
+            metadata,
+            vectors,
+            embeddingService,
+            authorizationService(environment),
+            environment,
+            retrievalCache(environment));
+    directJobWorker =
+        new dev.notify.artifact.worker.DirectJobWorker(
+            positiveInt(environment, "ARTIFACT_DIRECT_JOB_THREADS", 4),
+            positiveInt(environment, "ARTIFACT_DIRECT_JOB_QUEUE_CAPACITY", 256));
+    return new DefaultArtifactEngine(
+        jobs, new dev.notify.artifact.dispatcher.DirectJobDispatcher(directJobWorker));
   }
 
   private DeadLetterHandler defaultDeadLetterHandler(MultipartUploadStore multipartUploads, ObjectStore objects) {
@@ -520,10 +562,41 @@ public final class DefaultArtifactEngineProvider implements ArtifactEngineProvid
       Objects.requireNonNull(embeddings, "embeddings");
       Objects.requireNonNull(authorization, "authorization");
 
+      // Anything not supplied falls back to a process-local store or the component's own
+      // daemon-thread executor; the component that receives an executor shuts it down on close.
+      Environment environment = this.environment == null ? new StandardEnvironment() : this.environment;
+      MetadataStore baseMetadata = this.metadata == null ? new InMemoryStores.Metadata() : this.metadata;
+      VectorStore vectors = this.vectors == null ? new InMemoryStores.Vectors() : this.vectors;
+      JobStore jobStore = this.jobStore == null ? new InMemoryJobStore() : this.jobStore;
+      WorkflowStore workflowStore =
+          this.workflowStore == null ? new InMemoryWorkflowStore() : this.workflowStore;
+      MultipartUploadStore multipartUploads =
+          this.multipartUploads == null ? new InMemoryMultipartUploadStore() : this.multipartUploads;
+      DeadLetterQueue deadLetters =
+          this.deadLetters == null ? new InMemoryDeadLetterQueue() : this.deadLetters;
+      DeadLetterHandler deadLetterHandler =
+          this.deadLetterHandler == null
+              ? defaultDeadLetterHandler(multipartUploads, objects)
+              : this.deadLetterHandler;
+      ScheduledExecutorService queueMaintenanceExecutor =
+          this.queueMaintenanceExecutor == null
+              ? QueueManager.defaultExecutor()
+              : this.queueMaintenanceExecutor;
+      Worker.ExecutorFactory workerExecutors =
+          this.workerExecutors == null ? Worker.ExecutorFactory.defaults() : this.workerExecutors;
+      ScheduledExecutorService workflowExecutor =
+          this.workflowExecutor == null ? WorkflowManager.defaultExecutor() : this.workflowExecutor;
+      ScheduledExecutorService retryExecutor =
+          this.retryExecutor == null ? WorkflowRetryScheduler.defaultExecutor() : this.retryExecutor;
+      ExecutorService directJobExecutor =
+          this.directJobExecutor == null
+              ? dev.notify.artifact.worker.DirectJobWorker.defaultExecutor(4, 256)
+              : this.directJobExecutor;
+
       MetadataStore metadata =
           retrievalCache == null
-              ? this.metadata
-              : new InvalidatingMetadataStore(this.metadata, retrievalCache::invalidateTenant);
+              ? baseMetadata
+              : new InvalidatingMetadataStore(baseMetadata, retrievalCache::invalidateTenant);
 
       // Background processing: a durable queue per job type, workers that execute workflow steps,
       // and the workflow manager that submits them stage by stage.
@@ -696,7 +769,18 @@ public final class DefaultArtifactEngineProvider implements ArtifactEngineProvid
     }
   }
 
+  private static RetrievalResultCache retrievalCache(Environment environment) {
+    return new RetrievalResultCache(
+        positiveLong(environment, "ARTIFACT_RETRIEVAL_CACHE_MAX_BYTES", 64L * 1024 * 1024),
+        Duration.ofSeconds(positiveLong(environment, "ARTIFACT_RETRIEVAL_CACHE_TTL_SECONDS", 300)));
+  }
+
   private static HikariDataSource dataSource(Environment environment, String jdbcUrl) {
+    return dataSource(environment, jdbcUrl, positiveInt(environment, "ARTIFACT_JDBC_MAX_POOL_SIZE", 8));
+  }
+
+  private static HikariDataSource dataSource(
+      Environment environment, String jdbcUrl, int maxPoolSize) {
     HikariConfig configuration = new HikariConfig();
     configuration.setJdbcUrl(jdbcUrl);
     String username =
@@ -707,14 +791,17 @@ public final class DefaultArtifactEngineProvider implements ArtifactEngineProvid
             property(environment, "ARTIFACT_JDBC_PASSWORD"),
             property(environment, "DB_PASSWORD"),
             ""));
-    configuration.setMaximumPoolSize(positiveInt(environment, "ARTIFACT_JDBC_MAX_POOL_SIZE", 8));
+    configuration.setMaximumPoolSize(maxPoolSize);
     configuration.setMinimumIdle(positiveInt(environment, "ARTIFACT_JDBC_MIN_IDLE", 1));
     configuration.setPoolName("artifact-mcp-jdbc");
     return new HikariDataSource(configuration);
   }
 
-  static DefaultAuthorizationService authorizationService(Environment environment) {
-    String principalId = required(environment, ArtifactMcpStdioMain.PRINCIPAL_ENV);
+  /**
+   * The process serves one tenant; principals arrive with each request, so any principal of that
+   * tenant gets the configured scopes as a ceiling.
+   */
+  static AuthorizationService authorizationService(Environment environment) {
     String tenantId = required(environment, ArtifactMcpStdioMain.TENANT_ENV);
     Set<Permission> permissions = new LinkedHashSet<>();
     for (String configuredScope : required(environment, ArtifactMcpStdioMain.SCOPES_ENV).split(",")) {
@@ -733,8 +820,7 @@ public final class DefaultArtifactEngineProvider implements ArtifactEngineProvid
         }
       }
     }
-    return new DefaultAuthorizationService(
-        Map.of(new DefaultAuthorizationService.Subject(principalId, tenantId), permissions));
+    return new TenantAuthorizationService(tenantId, permissions);
   }
 
   private static String property(Environment environment, String name) {
