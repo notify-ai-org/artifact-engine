@@ -62,6 +62,8 @@ public final class DefaultArtifactJobFactory implements ArtifactJobFactory {
   private final double minSemanticScore;
   private final long multipartPartBytes;
   private final WorkflowManager workflowManager;
+  /** Media types the index step can read; set by whoever owns the extractors and OCR. */
+  private volatile java.util.function.Predicate<String> indexable = mediaType -> true;
   private final ChunkedIngestSupport chunkedIngest;
   private final RetrievalResultCache retrievalCache;
 
@@ -154,7 +156,18 @@ public final class DefaultArtifactJobFactory implements ArtifactJobFactory {
         accessVerifier,
         deduplicateContent,
         multipartPartBytes,
-        workflowManager);
+        workflowManager,
+        indexable);
+  }
+
+  /**
+   * Restricts indexing to media types the index step can read, usually
+   * {@code type -> IndexJob.canIndex(extractors, ocr, type)}. Other artifacts are stored with index
+   * status NOT_INDEXED instead of failing an index job. Defaults to indexing everything.
+   */
+  public DefaultArtifactJobFactory indexableMediaTypes(java.util.function.Predicate<String> indexable) {
+    this.indexable = Objects.requireNonNull(indexable, "indexable");
+    return this;
   }
 
   @Override

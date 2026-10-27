@@ -84,6 +84,35 @@ class IngestJobTest {
     assertThrows(SecurityException.class, () -> job(untouchable, denyAll).prepare());
   }
 
+  @Test
+  void contentWithoutAnExtractorIsStoredWithoutAnIndexJob() throws Exception {
+    Artifact artifact = new IngestJob(
+            new Requests.Ingest(
+                "tenant", "principal", null, "notes.txt", "text/plain", text("hello world"), -1, Map.of()),
+            metadata, spool, new ArtifactAccessVerifier(allowAll(), new DataVerifier()), true, 0, null,
+            type -> false)
+        .execute();
+
+    assertEquals(dev.notify.artifact.model.ArtifactStatus.Index.NOT_INDEXED, artifact.indexStatus());
+    assertEquals(
+        java.util.List.of(dev.notify.artifact.model.JobRecord.JobType.STORE,
+            dev.notify.artifact.model.JobRecord.JobType.RELEASE_SPOOL),
+        IngestJob.initialStages(artifact, 0, false).stream().map(stage -> stage.get(0).type()).toList());
+  }
+
+  @Test
+  void imagesAreIndexableOnlyWithOcr() {
+    var extractors = dev.notify.artifact.extract.TextExtractorFactory.defaults(1 << 20, 1 << 20);
+    dev.notify.artifact.ocr.Ocr ocr = (image, mediaType) -> "text";
+
+    assertTrue(IndexJob.canIndex(extractors, null, "text/plain"));
+    assertTrue(IndexJob.canIndex(extractors, null, "application/pdf"));
+    org.junit.jupiter.api.Assertions.assertFalse(IndexJob.canIndex(extractors, null, "image/png"));
+    assertTrue(IndexJob.canIndex(extractors, ocr, "image/png"));
+    org.junit.jupiter.api.Assertions.assertFalse(IndexJob.canIndex(extractors, ocr, "application/zip"));
+    org.junit.jupiter.api.Assertions.assertFalse(IndexJob.canIndex(extractors, ocr, null));
+  }
+
   private IngestJob job(InputStream content, AuthorizationService authorization) {
     return new IngestJob(
         new Requests.Ingest(

@@ -73,7 +73,7 @@ public final class SpoolReleaser {
 
   /**
    * Releases spool copies left by workflows that predate the release stage: artifacts that are
-   * stored and fully indexed. Anything still in flight is left alone.
+   * stored and fully indexed, or stored and never indexable. Anything still in flight is left alone.
    *
    * @return the number of spool copies released
    */
@@ -83,7 +83,8 @@ public final class SpoolReleaser {
       Optional<Artifact> artifact = metadataStore.findBySpoolPath(entry);
       if (artifact.isPresent()
           && artifact.get().storageStatus() == ArtifactStatus.Storage.STORED
-          && artifact.get().indexStatus() == ArtifactStatus.Index.READY
+          && (artifact.get().indexStatus() == ArtifactStatus.Index.READY
+              || artifact.get().indexStatus() == ArtifactStatus.Index.NOT_INDEXED)
           && release(artifact.get().tenantId(), artifact.get().id())) {
         released++;
       }

@@ -679,7 +679,8 @@ public final class DefaultArtifactEngineProvider implements ArtifactEngineProvid
               environment,
               workflowManager,
               null,
-              retrievalCache);
+              retrievalCache)
+          .indexableMediaTypes(type -> IndexJob.canIndex(extractors, ocr, type));
       directJobWorker =
           new dev.notify.artifact.worker.DirectJobWorker(
               directJobExecutor);

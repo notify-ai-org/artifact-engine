@@ -33,6 +33,7 @@ public final class IngestJob extends AbstractJob<Artifact> implements DirectJob<
   private final boolean deduplicateContent;
   private final long multipartPartBytes;
   private final WorkflowManager workflowManager;
+  private final java.util.function.Predicate<String> indexable;
   private final AtomicBoolean claimed = new AtomicBoolean();
   private volatile DurableSpool.SpoolEntry spoolEntry;
   private volatile String artifactId;
@@ -61,6 +62,20 @@ public final class IngestJob extends AbstractJob<Artifact> implements DirectJob<
       boolean deduplicateContent,
       long multipartPartBytes,
       WorkflowManager workflowManager) {
+    this(request, metadataStore, durableSpool, accessVerifier, deduplicateContent,
+        multipartPartBytes, workflowManager, mediaType -> true);
+  }
+
+  /** @param indexable media types the index step can read; others are stored without an index job */
+  public IngestJob(
+      Requests.Ingest request,
+      MetadataStore metadataStore,
+      DurableSpool durableSpool,
+      ArtifactAccessVerifier accessVerifier,
+      boolean deduplicateContent,
+      long multipartPartBytes,
+      WorkflowManager workflowManager,
+      java.util.function.Predicate<String> indexable) {
     super(accessVerifier, metadataStore);
     this.request = request;
     this.durableSpool = durableSpool;
@@ -68,6 +83,7 @@ public final class IngestJob extends AbstractJob<Artifact> implements DirectJob<
     this.deduplicateContent = deduplicateContent;
     this.multipartPartBytes = multipartPartBytes;
     this.workflowManager = workflowManager;
+    this.indexable = java.util.Objects.requireNonNull(indexable, "indexable");
   }
 
   /**
@@ -165,6 +181,11 @@ public final class IngestJob extends AbstractJob<Artifact> implements DirectJob<
             spoolEntry.sha256(),
             fingerprintMetadata(request, detectedMediaType, sanitizedFilename));
     Instant now = Instant.now();
+    boolean index = indexable.test(detectedMediaType);
+    if (!index) {
+      LOG.info("ingest_index_skipped", "artifact", artifactId, "type", detectedMediaType,
+          "reason", "no text extractor or OCR for this media type");
+    }
     Artifact artifact =
         new Artifact(
             artifactId,
@@ -180,7 +201,7 @@ public final class IngestJob extends AbstractJob<Artifact> implements DirectJob<
             null,
             spoolEntry.contentPath(),
             ArtifactStatus.Storage.SPOOLED,
-            ArtifactStatus.Index.PENDING,
+            index ? ArtifactStatus.Index.PENDING : ArtifactStatus.Index.NOT_INDEXED,
             1,
             securedMetadata,
             null,
@@ -188,7 +209,7 @@ public final class IngestJob extends AbstractJob<Artifact> implements DirectJob<
             now,
             now);
     try {
-      List<List<JobRecord>> stages = initialStages(artifact, multipartPartBytes);
+      List<List<JobRecord>> stages = initialStages(artifact, multipartPartBytes, index);
       MetadataStore.Registration registration =
           metadataStore.register(artifact, deduplicateContent);
       String workflowId = null;
@@ -234,11 +255,23 @@ public final class IngestJob extends AbstractJob<Artifact> implements DirectJob<
     }
   }
 
+  static List<List<JobRecord>> initialStages(Artifact artifact, long multipartPartBytes) {
+    return initialStages(artifact, multipartPartBytes, true);
+  }
+
   /**
    * Store, then index, then release the spool copy. An artifact larger than one part is stored as a
-   * multipart upload whose parts run in parallel: INIT, then every PART, then COMPLETE.
+   * multipart upload whose parts run in parallel: INIT, then every PART, then COMPLETE. Content that
+   * cannot be indexed skips the index stage.
    */
-  static List<List<JobRecord>> initialStages(Artifact artifact, long multipartPartBytes) {
+  static List<List<JobRecord>> initialStages(Artifact artifact, long multipartPartBytes, boolean index) {
+    List<List<JobRecord>> stages = stagesWithIndex(artifact, multipartPartBytes);
+    return index ? stages : stages.stream()
+        .filter(stage -> stage.get(0).type() != JobRecord.JobType.INDEX)
+        .toList();
+  }
+
+  private static List<List<JobRecord>> stagesWithIndex(Artifact artifact, long multipartPartBytes) {
     String version = Long.toString(artifact.version());
     JobRecord index = pending(artifact, JobRecord.JobType.INDEX, "", Map.of("version", version));
     JobRecord release =

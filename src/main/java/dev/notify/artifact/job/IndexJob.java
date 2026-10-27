@@ -258,6 +258,16 @@ public final class IndexJob extends AbstractJob<Integer> implements QueueableJob
   }
 
   /**
+   * Whether the index step can extract text from a media type: a native extractor supports it, or it
+   * is an image and OCR is configured. Ingest uses this to skip indexing content it would fail on.
+   */
+  public static boolean canIndex(TextExtractorFactory extractors, Ocr ocr, String mediaType) {
+    if (mediaType == null) return false;
+    if (extractors != null && extractors.find(mediaType).isPresent()) return true;
+    return ocr != null && mediaType.trim().toLowerCase(java.util.Locale.ROOT).startsWith("image/");
+  }
+
+  /**
    * Extractors need a random-access local file. The spool copy is used while it exists; otherwise
    * the stored object is staged to a scratch file on the spool volume and deleted afterwards.
    */
