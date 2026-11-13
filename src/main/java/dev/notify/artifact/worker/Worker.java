@@ -503,7 +503,7 @@ public final class Worker implements AutoCloseable {
   private static StateMachine<JobStateMachines.State> stateMachine(JobRecord.JobType type) {
     return switch (type) {
       case INGEST, STORE, STORE_INIT, STORE_PART, STORE_COMPLETE, RELEASE_SPOOL, BUFFER_CHUNK,
-          SPOOL_CHUNK, STORE_CHUNK, INDEX_CHUNK, RELEASE_BUFFER, SPOOL_COMMIT, INDEX_FINAL ->
+           STORE_CHUNK, INDEX_CHUNK, RELEASE_BUFFER, INDEX_FINAL ->
           new JobStateMachines.Ingest();
       case FETCH -> new JobStateMachines.Fetch();
       case INDEX -> new JobStateMachines.Index();

@@ -176,7 +176,7 @@ public final class DefaultArtifactJobFactory implements ArtifactJobFactory {
       throw new UnsupportedOperationException("Source ingest is not configured");
     }
     return new SourceIngestJob(
-        request, metadataStore, durableSpool, accessVerifier, chunkedIngest, workflowManager);
+        request, metadataStore, accessVerifier, chunkedIngest, workflowManager);
   }
 
   @Override

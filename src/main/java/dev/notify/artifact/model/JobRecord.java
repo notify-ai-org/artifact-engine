@@ -66,16 +66,12 @@ public record JobRecord(
     RELEASE_SPOOL,
     /** Chunked source ingest: reads one byte range of the source into the chunk buffer pool. */
     BUFFER_CHUNK,
-    /** Chunked source ingest: writes a buffered chunk into the reserved spool entry. */
-    SPOOL_CHUNK,
     /** Chunked source ingest: uploads a buffered chunk as one multipart part. */
     STORE_CHUNK,
     /** Chunked source ingest: extracts, chunks, and embeds a buffered text/plain chunk. */
     INDEX_CHUNK,
     /** Chunked source ingest: returns a chunk's buffer to the pool. */
     RELEASE_BUFFER,
-    /** Chunked source ingest: verifies, hashes, and publishes the fully written spool entry. */
-    SPOOL_COMMIT,
     /** Chunked source ingest: finishes text indexing, or indexes other formats from the spool. */
     INDEX_FINAL,
     FETCH,

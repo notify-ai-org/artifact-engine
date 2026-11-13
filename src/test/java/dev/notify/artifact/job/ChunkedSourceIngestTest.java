@@ -122,9 +122,9 @@ class ChunkedSourceIngestTest {
     queues.start();
     List<WorkerManager.WorkerConfiguration> configs = new ArrayList<>();
     for (JobRecord.JobType type : List.of(JobRecord.JobType.STORE_INIT,
-        JobRecord.JobType.BUFFER_CHUNK, JobRecord.JobType.SPOOL_CHUNK,
+        JobRecord.JobType.BUFFER_CHUNK,
         JobRecord.JobType.STORE_CHUNK, JobRecord.JobType.INDEX_CHUNK,
-        JobRecord.JobType.RELEASE_BUFFER, JobRecord.JobType.SPOOL_COMMIT,
+        JobRecord.JobType.RELEASE_BUFFER,
         JobRecord.JobType.INDEX_FINAL, JobRecord.JobType.STORE_COMPLETE,
         JobRecord.JobType.RELEASE_SPOOL)) {
       configs.add(new WorkerManager.WorkerConfiguration(
@@ -172,9 +172,7 @@ class ChunkedSourceIngestTest {
     assertEquals(1 + 3 * 4 + 2, done.workflowSteps().size(),
         "STORE_INIT, 3 x (buffer, store, index, release), STORE_COMPLETE + INDEX_FINAL");
     assertTrue(done.workflowSteps().stream().map(step -> step.jobRecord().type())
-        .noneMatch(type -> type == JobRecord.JobType.SPOOL_CHUNK
-            || type == JobRecord.JobType.SPOOL_COMMIT
-            || type == JobRecord.JobType.RELEASE_SPOOL));
+        .noneMatch(type -> type == JobRecord.JobType.RELEASE_SPOOL));
 
     Artifact stored = current(planned.id());
     assertEquals(ArtifactStatus.Storage.STORED, stored.storageStatus());

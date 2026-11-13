@@ -50,7 +50,6 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.stream.Collectors;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 import software.amazon.awssdk.http.urlconnection.UrlConnectionHttpClient;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.s3.S3Client;
@@ -176,9 +175,7 @@ class LargeFileS3UploadIT {
               TextExtractorFactory.defaults(1, 1), null, new Chunker(300, 30),
               IndexJob.Options.defaults(), uploads, new SpoolReleaser(metadata, spool),
               new StorageKeyFactory(environment, Clock.systemUTC()), support);
-      JobRecordExecutor executor = record -> record.type() == JobRecord.JobType.SPOOL_COMMIT
-          ? () -> commitWithoutMediaCheck(metadata, spool, record)
-          : jobs.toJob(record);
+      JobRecordExecutor executor = record -> jobs.toJob(record);
       queues.start();
       List<WorkerManager.WorkerConfiguration> workers = new ArrayList<>();
       workers.add(worker("store-init", 1, JobRecord.JobType.STORE_INIT));
@@ -186,9 +183,7 @@ class LargeFileS3UploadIT {
         workers.add(worker("buffer-" + index, 1, JobRecord.JobType.BUFFER_CHUNK));
         workers.add(worker("store-chunk-" + index, 1, JobRecord.JobType.STORE_CHUNK));
       }
-      workers.add(worker("spool-chunk", 1, JobRecord.JobType.SPOOL_CHUNK));
       workers.add(worker("release-buffer", 4, JobRecord.JobType.RELEASE_BUFFER));
-      workers.add(worker("spool-commit", 1, JobRecord.JobType.SPOOL_COMMIT));
       workers.add(worker("store-complete", 1, JobRecord.JobType.STORE_COMPLETE));
       workers.add(worker("release-spool", 1, JobRecord.JobType.RELEASE_SPOOL));
 
@@ -271,17 +266,6 @@ class LargeFileS3UploadIT {
     return kept;
   }
 
-  /** {@link SpoolCommitJob} without {@code DataVerifier}, which rejects binary content. */
-  private static Artifact commitWithoutMediaCheck(
-      InMemoryStores.Metadata metadata, DurableSpool spool, JobRecord record) throws Exception {
-    Artifact artifact = metadata.find(record.tenantId(), record.artifactId()).orElseThrow();
-    Instant started = Instant.now();
-    DurableSpool.SpoolEntry entry = spool.commit(artifact.spoolPath(), artifact.sizeBytes());
-    log("spool committed in %s (sha256 %s)", Duration.between(started, Instant.now()),
-        entry.sha256());
-    return metadata.update(record.tenantId(), record.artifactId(),
-        current -> current.withContentDigest(entry.sha256()));
-  }
 
   /** Polls until the workflow completes or crashes, logging chunk progress every 30 seconds. */
   private static Workflow awaitTerminal(InMemoryWorkflowStore workflows, String id, Duration timeout)

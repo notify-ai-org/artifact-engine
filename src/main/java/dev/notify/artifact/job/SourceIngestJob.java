@@ -44,21 +44,13 @@ import java.util.UUID;
  * final        STORE_COMPLETE || INDEX_FINAL
  * </pre>
  *
- * Other formats cannot be parsed in byte chunks, so they are also spooled and indexed whole:
- *
- * <pre>
- * chunks       STORE_INIT
- *              BUFFER_i -> ( SPOOL_i || STORE_CHUNK_i (after STORE_INIT) ) -> RELEASE_BUFFER_i
- * final        SPOOL_COMMIT -> INDEX_FINAL,  STORE_COMPLETE  -> RELEASE_SPOOL
- * </pre>
- *
  * Two orderings cross chunks: INDEX_CHUNK_i waits for INDEX_CHUNK_(i-1), since it resumes that
  * chunk's chunker and digest state, and BUFFER_i waits for RELEASE_BUFFER_(i-w), where w is the
  * buffer pool's slab count, so an ingest never loads more chunks than the pool can hold.
  *
  * The content's SHA-256 is unknown when the artifact is registered, so it carries a provisional
- * digest until INDEX_FINAL (text, from the running digest kept by INDEX_CHUNK) or SPOOL_COMMIT
- * (other formats) records the real one. Content deduplication does not apply to source ingests.
+ * digest until INDEX_FINAL (text, from the running digest kept by INDEX_CHUNK) records the real one. 
+ * Content deduplication does not apply to source ingests.
  * A lost chunk buffer is always re-read from the source, which is also how text ingests recover
  * without a spool copy.
  */
@@ -67,7 +59,6 @@ public final class SourceIngestJob extends AbstractJob<Artifact> implements Dire
   static final String WORKFLOW_NAME = "ingest-source";
 
   private final Requests.IngestSource request;
-  private final DurableSpool spool;
   private final ArtifactAccessVerifier accessVerifier;
   private final ChunkedIngestSupport support;
   private final WorkflowManager workflowManager;
@@ -75,13 +66,11 @@ public final class SourceIngestJob extends AbstractJob<Artifact> implements Dire
   public SourceIngestJob(
       Requests.IngestSource request,
       MetadataStore metadataStore,
-      DurableSpool spool,
       ArtifactAccessVerifier accessVerifier,
       ChunkedIngestSupport support,
       WorkflowManager workflowManager) {
     super(accessVerifier, metadataStore);
     this.request = Objects.requireNonNull(request, "request");
-    this.spool = Objects.requireNonNull(spool, "spool");
     this.accessVerifier = Objects.requireNonNull(accessVerifier, "accessVerifier");
     this.support = Objects.requireNonNull(support, "support");
     this.workflowManager = Objects.requireNonNull(workflowManager, "workflowManager");
@@ -94,6 +83,16 @@ public final class SourceIngestJob extends AbstractJob<Artifact> implements Dire
     ChunkSource source = support.sources().open(request.location());
     ChunkSource.SourceInfo info = source.describe();
     if (info.length() < 1) throw new IllegalArgumentException("Source is empty");
+    ByteBuffer prefix = ByteBuffer.allocate((int) Math.min(DataVerifier.sniffBytes(), info.length()));
+    String mediaType = accessVerifier.verifyPrefix(prefix.array(), request.declaredMediaType());
+    String name = accessVerifier.sanitizedFilename(
+        request.originalName() != null ? request.originalName() : lastSegment(request.location()));
+
+    String artifactId = UUID.randomUUID().toString();
+    boolean textChunks = "text/plain".equals(mediaType);
+    if(!textChunks){
+      throw new IllegalArgumentException("Source ingest only supports text/plain media type");
+    }
     MultipartPlan plan = MultipartPlan.forSize(info.length(), support.chunkBytes());
     if (plan == null) plan = new MultipartPlan(info.length(), support.chunkBytes(), 1);
     if (plan.partSize() > support.chunkBytes()) {
@@ -101,17 +100,7 @@ public final class SourceIngestJob extends AbstractJob<Artifact> implements Dire
           + " chunks of " + support.chunkBytes() + " bytes; raise the chunk size");
     }
 
-    ByteBuffer prefix = ByteBuffer.allocate((int) Math.min(DataVerifier.sniffBytes(), info.length()));
     source.read(0, prefix, info.version());
-    String mediaType = accessVerifier.verifyPrefix(prefix.array(), request.declaredMediaType());
-    String name = accessVerifier.sanitizedFilename(
-        request.originalName() != null ? request.originalName() : lastSegment(request.location()));
-
-    String artifactId = UUID.randomUUID().toString();
-    boolean textChunks = "text/plain".equals(mediaType);
-    java.nio.file.Path spoolPath = textChunks
-        ? null
-        : spool.reserve(request.tenantId(), artifactId, info.length(), request.metadata());
     try {
       String sourceIdentity = Checksum.sha256(
           request.location() + "|" + info.version() + "|" + info.length());
@@ -126,13 +115,12 @@ public final class SourceIngestJob extends AbstractJob<Artifact> implements Dire
           artifactId, request.tenantId(), idempotencyKey,
           Idempotency.fingerprint(request.tenantId(), "INGEST_SOURCE", sourceIdentity, fingerprint),
           sourceType(request.location()), request.location(), name, mediaType, info.length(),
-          Artifact.PENDING_DIGEST_PREFIX + sourceIdentity.substring(0, 56), null, spoolPath,
+          Artifact.PENDING_DIGEST_PREFIX + sourceIdentity.substring(0, 56), null, null,
           ArtifactStatus.Storage.RECEIVING, ArtifactStatus.Index.PENDING, 1,
           new TreeMap<>(request.metadata()), null, null, now, now);
 
       MetadataStore.Registration registration = metadataStore.register(artifact, false);
       if (registration.outcome() != MetadataStore.Registration.Outcome.CREATED) {
-        if (spoolPath != null) spool.discardReserved(spoolPath);
         LOG.info("ingest_deduplicated", "artifact", artifactId,
             "existingArtifact", registration.artifact().id(), "outcome", registration.outcome());
         return registration.artifact();
@@ -149,14 +137,9 @@ public final class SourceIngestJob extends AbstractJob<Artifact> implements Dire
           "spool", textChunks ? "none" : "reserved",
           "workflow", workflowId);
       return artifact;
-    } catch (IOException | RuntimeException failure) {
+    } catch (RuntimeException failure) {
       LOG.warn("ingest_source_failed", "artifact", artifactId,
           "error", failure.getClass().getSimpleName(), "reason", failure.getMessage());
-      try {
-        if (spoolPath != null) spool.discardReserved(spoolPath);
-      } catch (IOException cleanup) {
-        failure.addSuppressed(cleanup);
-      }
       throw failure;
     }
   }
@@ -198,19 +181,13 @@ public final class SourceIngestJob extends AbstractJob<Artifact> implements Dire
           ? PlannedStep.after(buffer, releases.get(number - 1 - chunksInFlight))
           : PlannedStep.independent(buffer));
       chunks.add(PlannedStep.after(stored, buffer, init));
-      if (textChunks) {
-        // INDEX_CHUNK resumes the previous chunk's chunker, decoder, and digest state.
-        JobRecord indexed = job(artifact, JobRecord.JobType.INDEX_CHUNK, number, chunk);
-        chunks.add(previousIndex == null
-            ? PlannedStep.after(indexed, buffer)
-            : PlannedStep.after(indexed, buffer, previousIndex));
-        chunks.add(PlannedStep.after(release, stored, indexed));
-        previousIndex = indexed;
-      } else {
-        JobRecord spooled = job(artifact, JobRecord.JobType.SPOOL_CHUNK, number, chunk);
-        chunks.add(PlannedStep.after(spooled, buffer));
-        chunks.add(PlannedStep.after(release, stored, spooled));
-      }
+      // INDEX_CHUNK resumes the previous chunk's chunker, decoder, and digest state.
+      JobRecord indexed = job(artifact, JobRecord.JobType.INDEX_CHUNK, number, chunk);
+      chunks.add(previousIndex == null
+          ? PlannedStep.after(indexed, buffer)
+          : PlannedStep.after(indexed, buffer, previousIndex));
+      chunks.add(PlannedStep.after(release, stored, indexed));
+      previousIndex = indexed;
       releases.add(release);
     }
     stages.add(chunks);
@@ -224,14 +201,9 @@ public final class SourceIngestJob extends AbstractJob<Artifact> implements Dire
       stages.add(List.of(PlannedStep.independent(complete), PlannedStep.independent(index)));
       return stages;
     }
-    JobRecord commit = job(artifact, JobRecord.JobType.SPOOL_COMMIT, 0, Map.of("version", version));
-    JobRecord releaseSpool =
-        job(artifact, JobRecord.JobType.RELEASE_SPOOL, 0, Map.of("version", version));
     stages.add(List.of(
-        PlannedStep.independent(commit),
         PlannedStep.independent(complete),
-        PlannedStep.after(index, commit),
-        PlannedStep.after(releaseSpool, index, complete)));
+        PlannedStep.after(index, complete)));
     return stages;
   }
 

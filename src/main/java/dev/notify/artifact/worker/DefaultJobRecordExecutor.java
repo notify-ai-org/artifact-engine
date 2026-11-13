@@ -9,8 +9,6 @@ import dev.notify.artifact.job.IndexChunkJob;
 import dev.notify.artifact.job.IndexFinalJob;
 import dev.notify.artifact.job.IndexJob;
 import dev.notify.artifact.job.ReleaseBufferJob;
-import dev.notify.artifact.job.SpoolChunkJob;
-import dev.notify.artifact.job.SpoolCommitJob;
 import dev.notify.artifact.job.StoreChunkJob;
 import dev.notify.artifact.job.Job;
 import dev.notify.artifact.job.ReleaseSpoolJob;
@@ -118,13 +116,11 @@ public final class DefaultJobRecordExecutor implements JobRecordExecutor {
           record.tenantId(), record.artifactId(), metadata, objects, spool, extractors, ocr,
           chunker, embeddings, vectors, indexOptions);
       case BUFFER_CHUNK -> new BufferChunkJob(record, metadata, chunked(record));
-      case SPOOL_CHUNK -> new SpoolChunkJob(record, metadata, spool, chunked(record));
       case STORE_CHUNK ->
           new StoreChunkJob(record, metadata, objects, multipartUploads, chunked(record));
       case INDEX_CHUNK -> new IndexChunkJob(
           record, metadata, embeddings, vectors, chunker, indexOptions, chunked(record));
       case RELEASE_BUFFER -> new ReleaseBufferJob(record, chunked(record));
-      case SPOOL_COMMIT -> new SpoolCommitJob(record, metadata, spool, dataVerifier);
       case INDEX_FINAL -> new IndexFinalJob(
           record, metadata, embeddings, vectors, chunker, indexOptions, chunked(record),
           () -> new IndexJob(
